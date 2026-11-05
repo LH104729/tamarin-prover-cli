@@ -11,7 +11,7 @@ license = {text = "GPL-3.0-or-later"}
 dependencies = []
 
 [project.scripts]
-tamarin-step = "tamarin_cli.repl:main"
+tamarin-cli = "tamarin_cli.repl:main"
 
 [tool.setuptools]
 packages = ["tamarin_cli"]

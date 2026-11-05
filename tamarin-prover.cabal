@@ -62,7 +62,7 @@ extra-source-files:
   data/intruder_variants_bp.spthy
 
   -- terminal proof explorer and real-engine integration regressions
-  tamarin-step
+  tamarin-cli
   python/pyproject.toml
   python/tamarin_cli/*.py
   python/tests/*.py

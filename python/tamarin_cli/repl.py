@@ -340,7 +340,7 @@ class TamarinShell(cmd.Cmd):
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """Run the manual proof terminal; return a conventional process exit code."""
     parser = argparse.ArgumentParser(
-        prog="tamarin-step",
+        prog="tamarin-cli",
         description="Manually explore Tamarin proofs; no proof methods run automatically.",
         epilog="Quote REPL paths containing spaces. Use help inside the REPL for commands.",
     )

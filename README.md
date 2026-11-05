@@ -22,7 +22,7 @@ Build and run from this checkout without installing Tamarin:
 
 ```sh
 stack build --no-install-ghc
-./tamarin-step examples/Tutorial.spthy
+./tamarin-cli examples/Tutorial.spthy
 ```
 
 Requires Python 3.9 or newer and a working Maude installation. The Python
@@ -31,7 +31,7 @@ build rather than an older `tamarin-prover` on `PATH`. Outside a checkout it
 uses `tamarin-prover` from `PATH`; override either with `--backend 'COMMAND'`
 or `TAMARIN_BACKEND`. The command is an executable prefix, not a shell script;
 the client appends the `proof-api` mode. The Python package can also be installed
-separately with `python3 -m pip install ./python`, providing `tamarin-step`.
+separately with `python3 -m pip install ./python`, providing `tamarin-cli`.
 
 The REPL supports:
 
