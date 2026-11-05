@@ -58,3 +58,8 @@ tags
 **/benchmark
 **/input
 
+
+# Python terminal client build and interpreter artifacts
+python/**/__pycache__/
+python/build/
+python/*.egg-info/

@@ -12,6 +12,7 @@ import Main.Mode.Batch       (batchMode)
 import Main.Mode.Test        (testMode)
 import Main.Mode.Interactive (interactiveMode)
 import Main.Mode.Intruder    (intruderMode)
+import Main.Mode.ProofAPI     (proofAPIMode)
 
 main :: IO ()
-main = defaultMain batchMode [interactiveMode, intruderMode, testMode]
+main = defaultMain batchMode [interactiveMode, proofAPIMode, intruderMode, testMode]

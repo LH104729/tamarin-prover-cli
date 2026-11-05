@@ -15,6 +15,103 @@ Developing and contributing
 See [contributing instructions](CONTRIBUTING.md) for instructions on how to develop,
 test and release changes to the Tamarin prover source code.
 
+Manual proof exploration in the terminal
+----------------------------------------
+
+Build and run from this checkout without installing Tamarin:
+
+```sh
+stack build --no-install-ghc
+./tamarin-step examples/Tutorial.spthy
+```
+
+Requires Python 3.9 or newer and a working Maude installation. The Python
+frontend uses only the standard library. In a checkout it uses the local Stack
+build rather than an older `tamarin-prover` on `PATH`. Outside a checkout it
+uses `tamarin-prover` from `PATH`; override either with `--backend 'COMMAND'`
+or `TAMARIN_BACKEND`. The command is an executable prefix, not a shell script;
+the client appends the `proof-api` mode. The Python package can also be installed
+separately with `python3 -m pip install ./python`, providing `tamarin-step`.
+
+The REPL supports:
+
+| Commands (shortcuts) | Operation |
+| --- | --- |
+| `load` (`ld`), `lemmas` (`ls`), `lemma` (`l`) | Load a native theory; list, select, or resume lemmas |
+| `state` (`s`), `goals` (`g`), `methods` (`m`) | Inspect constraints, facts, open goals, and applicable methods |
+| `apply <id>` (`a <id>`) | Execute exactly one explicitly selected engine proof method |
+| `branches` (`bs`), `branch <id>` (`b <id>`), `back` (`p`) | Inspect children, select one, or return to its parent |
+| `undo` (`u`) | Replace the selected step and descendants with `sorry` |
+| `tree` (`t`) | Display the selected lemma's complete proof tree |
+| `save` (`w`), `check` (`c`) | Save native `.spthy`; replay recorded steps and report proof completeness |
+| `help` (`h`), `quit` (`q`) | Command help; exit without automatically saving |
+
+Shortcuts accept the same arguments as their full commands, for example
+`ld "my theory.spthy"`, `l secrecy`, `a 0`, or `w "partial proof.spthy"`.
+`help` lists shortcuts; `help a` (or `h a`) shows help for `apply`.
+
+Method and branch IDs are local, zero-based indices. Applying a method leaves
+the cursor at its node; use `branches` and `branch <id>` to inspect resulting
+states. Switch siblings with `back`, then `branch <id>`. Lemma switches retain
+each lemma's tree and cursor. `undo` at an unfinished leaf resets the nearest
+applied ancestor; it discards that step's subtree. Undo before replacing an
+existing step. Empty lines never repeat proof commands.
+
+Loading another theory explicitly replaces the session; save first to retain
+edits. Quote paths containing spaces. `quit`, EOF, and Ctrl-C do not save
+automatically. Readline command history is available within the session.
+
+Proof construction reuses Tamarin's native methods, including simplification,
+induction, and constraint solving. The engine may immediately recognize terminal
+cases, as in Explore mode, but the CLI does not automatically choose subsequent
+methods. `check` replays recorded proof steps without proof search and returns
+`verified`, `falsified`, `incomplete`, or `invalid`. A remaining `sorry` always
+makes the CLI's result incomplete, even if another branch already contains a
+witness; the original prover retains its own quantifier-specific reporting.
+
+Saving preserves source theory declarations and native proof scripts, not
+original whitespace. Partial proofs retain explicit `sorry` branches. Saved
+files can be reloaded here, opened in the original GUI, or checked by the
+standard prover, for example `stack exec -- tamarin-prover saved.spthy`.
+Passing `--prove` to the standard prover explicitly requests automatic search.
+The terminal currently explores trace lemmas; diff/equivalence theories still
+require the original GUI.
+
+For Python programs, add `python/` to `PYTHONPATH` or install the package:
+
+```python
+from tamarin_cli import TamarinClient
+
+with TamarinClient() as client:
+    client.load("theory.spthy")
+    client.lemma("secrecy")
+    methods = client.methods()["methods"]
+    # Inspect methods before explicitly calling client.apply(method_id).
+    print(methods)
+    client.save("partial.spthy")
+```
+
+Every client operation returns a response dictionary. Backend command errors
+raise `BackendError` without replacing the session. `request(command, **fields)`
+exposes the underlying protocol for scripting. The synchronous client owns one
+backend process; use a context manager or `close()` to release it.
+
+The backend can be used directly with
+`stack exec --no-install-ghc -- tamarin-prover proof-api`. It accepts one JSON
+object per input line and emits one response per line; engine diagnostics go
+to stderr. Requests use `command` and, where needed, `file`, `name`,
+`method_id`, or `branch_id`. Command names match the REPL. Responses have
+`status: "success"` or `status: "error"` with a `message`; current-node status
+is `branch_status`. Trees and branches expose numeric-path `node_id` values.
+Persistent proof files are exclusively native `.spthy`, never JSON.
+
+Run the real-engine integration regressions after building:
+
+```sh
+PYTHONPATH=python python3 -m unittest discover -s python/tests -v
+```
+
+
 
 Version Numbering Policy
 -----------------------

@@ -61,6 +61,12 @@ extra-source-files:
   data/intruder_variants_dh.spthy
   data/intruder_variants_bp.spthy
 
+  -- terminal proof explorer and real-engine integration regressions
+  tamarin-step
+  python/pyproject.toml
+  python/tamarin_cli/*.py
+  python/tests/*.py
+
   -- files for the web-frontend
   data/img/*.ico
   data/img/*.gif
@@ -123,6 +129,7 @@ executable tamarin-prover
 
     build-depends:
         HUnit
+      , aeson
       , base
       , binary
       , binary-orphans
@@ -135,6 +142,7 @@ executable tamarin-prover
       , deepseq
       , directory
       , exceptions
+      , fclabels
       , file-embed
       , filepath
       , gitrev
@@ -173,6 +181,7 @@ executable tamarin-prover
       Main.Utils
       Main.Mode.Batch
       Main.Mode.Interactive
+      Main.Mode.ProofAPI
       Main.Mode.Intruder
       Main.Mode.Test
 
