@@ -49,7 +49,7 @@ data Snapshot = Snapshot
 
 data Mutation = Mutation !Snapshot !Snapshot
 
-data Request = Request String (Maybe String) (Maybe Int)
+data Request = Request String (Maybe String) (Maybe Int) (Maybe Integer)
 
 proofAPIMode :: TamarinMode
 proofAPIMode = tamarinMode "proof-api"
@@ -70,17 +70,19 @@ runAPI _ args = bracket (hDuplicate stdout) hClose $ \protocol -> do
   hSetBuffering protocol LineBuffering
   hDuplicateTo stderr stdout
   hSetBuffering stdout LineBuffering
-  loop protocol Nothing
+  loop protocol 0 Nothing
   where
     opts = Loader.defaultTheoryLoadOptions
       { Loader.maudePath = maudePath args }
-    loop protocol session = do
+    -- Revisions belong to the protocol session, not restorable proof history.
+    loop protocol revision session = do
       eof <- hIsEOF stdin
       unless eof $ do
         line <- BS.hGetLine stdin
         outcome <- try $ do
           request <- either apiError pure $ eitherDecodeStrict' line >>= parseEither parseRequest
-          (next, response, stop) <- dispatch opts session request
+          (next, response, stop) <- dispatch opts revision session request
+          let nextRevision = if changesRevision request then revision + 1 else revision
           -- Force both the new engine state and the complete response before
           -- committing: a lazy Maude/pretty-printer exception is an error reply,
           -- not a half JSON line or a corrupted session.
@@ -90,34 +92,41 @@ runAPI _ args = bracket (hDuplicate stdout) hClose $ \protocol -> do
               _ <- evaluate (force (currentTheory s))
               _ <- evaluate (force (cachedMethods s))
               pure ()
-          bytes <- evaluate (force (encode response))
-          pure (next, bytes, stop)
+          bytes <- evaluate (force (encode (success nextRevision response)))
+          pure (next, nextRevision, bytes, stop)
         case outcome of
           Left (e :: SomeException) -> case fromException e :: Maybe AsyncException of
             Just a -> throwIO a
             Nothing -> do
               BL.hPutStr protocol $ encode $ object
-                ["status" .= ("error" :: String), "message" .= displayException e]
+                ["status" .= ("error" :: String), "message" .= displayException e,
+                 "revision" .= revision]
               BS.hPutStr protocol "\n"
               hFlush protocol
-              loop protocol session
-          Right (next, bytes, stop) -> do
+              loop protocol revision session
+          Right (next, nextRevision, bytes, stop) -> do
             BL.hPutStr protocol bytes
             BS.hPutStr protocol "\n"
             hFlush protocol
-            unless stop $ loop protocol next
+            unless stop $ loop protocol nextRevision next
 
 parseRequest :: Value -> Parser Request
 parseRequest = withObject "request" $ \o -> do
   command <- o .: "command"
   case command :: String of
-    "load" -> Request command . Just <$> o .: "file" <*> pure Nothing
-    "save" -> Request command . Just <$> o .: "file" <*> pure Nothing
-    "lemma" -> Request command . Just <$> o .: "name" <*> pure Nothing
+    "load" -> Request command . Just <$> o .: "file" <*> pure Nothing <*> pure Nothing
+    "save" -> Request command . Just <$> o .: "file" <*> pure Nothing <*> pure Nothing
+    "lemma" -> Request command . Just <$> o .: "name" <*> pure Nothing <*> pure Nothing
     "apply" -> Request command Nothing . Just <$> o .: "method_id"
+      <*> (Just <$> o .: "expected_revision")
     "step" -> Request "apply" Nothing . Just <$> o .: "method_id"
-    "branch" -> Request command Nothing . Just <$> o .: "branch_id"
-    _ -> pure $ Request command Nothing Nothing
+      <*> (Just <$> o .: "expected_revision")
+    "branch" -> Request command Nothing . Just <$> o .: "branch_id" <*> pure Nothing
+    _ -> pure $ Request command Nothing Nothing Nothing
+
+changesRevision :: Request -> Bool
+changesRevision (Request command _ _ _) = command `elem`
+  ["load", "lemma", "branch", "back", "apply", "reset", "undo", "redo", "check"]
 
 apiError :: String -> IO a
 apiError = ioError . userError
@@ -125,14 +134,17 @@ apiError = ioError . userError
 require :: String -> Maybe a -> IO a
 require message = maybe (apiError message) pure
 
-success :: [Pair] -> Value
-success fields = object $ "status" .= ("success" :: String) : fields
+success :: Integer -> [Pair] -> Value
+success revision fields = object $
+  ["status" .= ("success" :: String), "revision" .= revision] ++ fields
 
 -- A failed operation never installs its candidate Session in the loop.
-dispatch :: Loader.TheoryLoadOptions -> Maybe Session -> Request
-         -> IO (Maybe Session, Value, Bool)
-dispatch opts previous (Request command text index)
-  | command == "quit" = pure (previous, success [], True)
+dispatch :: Loader.TheoryLoadOptions -> Integer -> Maybe Session -> Request
+         -> IO (Maybe Session, [Pair], Bool)
+dispatch opts revision previous (Request command text index expectedRevision)
+  | command == "apply" && expectedRevision /= Just revision =
+      apiError "Stale expected_revision; refresh state or methods before applying a method"
+  | command == "quit" = pure (previous, [], True)
   | command == "load" = do
       file <- require "Missing file" text
       contents <- readFile file
@@ -153,12 +165,12 @@ dispatch opts previous (Request command text index)
               ++ render (prettyWfErrorReport warnings)
           pure t
       let session = Session original thy Nothing M.empty [] [] []
-      pure (Just session, success
+      pure (Just session,
         ["theory" .= L.get thyName thy, "file" .= file, "lemmas" .= lemmaValues thy], False)
   | otherwise = do
       session <- require "No theory loaded; use load first" previous
       case command of
-        "lemmas" -> unchanged session $ success ["lemmas" .= lemmaValues (currentTheory session)]
+        "lemmas" -> unchanged session ["lemmas" .= lemmaValues (currentTheory session)]
         "lemma" -> do
           name <- require "Missing lemma name" text
           _ <- require "No such lemma" $ lookupLemma name (currentTheory session)
@@ -170,17 +182,17 @@ dispatch opts previous (Request command text index)
               contents = render (prettyOpenTheory saved) ++ "\n"
           _ <- evaluate (force contents)
           atomicSave file contents
-          unchanged session $ success ["file" .= file]
+          unchanged session ["file" .= file]
         "state" -> selected session []
         "methods" -> do
           _ <- selection session
-          unchanged session $ success ["methods" .= methodValues session]
+          unchanged session ["methods" .= methodValues session]
         "goals" -> do
           (_, _, _, node) <- selection session
-          unchanged session $ success ["goals" .= goalValues node]
+          unchanged session ["goals" .= goalValues node]
         "branches" -> do
           (_, proof, path, node) <- selection session
-          unchanged session $ success ["branches" .= branchValues proof path node]
+          unchanged session ["branches" .= branchValues proof path node]
         "branch" -> do
           (name, _, path, node) <- selection session
           i <- require "Missing branch_id" index
@@ -238,7 +250,7 @@ dispatch opts previous (Request command text index)
           selected (rememberMutation session installed) []
         "tree" -> do
           (name, proof, _, _) <- selection session
-          unchanged session $ success ["lemma" .= name, "tree" .= treeValue "0" name proof]
+          unchanged session ["lemma" .= name, "tree" .= treeValue "0" name proof]
         "check" -> do
           (name, _, _, _) <- selection session
           -- Replay only recorded steps. New or unfinished cases remain sorry;
@@ -247,14 +259,14 @@ dispatch opts previous (Request command text index)
           next <- refresh session { currentTheory = replayed }
           lemma <- require "No such lemma" $ lookupLemma name replayed
           let (result, message) = checkedResult replayed lemma
-          pure (Just next, success
+          pure (Just next,
             ["lemma" .= name, "result" .= result, "message" .= message], False)
         _ -> apiError $ "Unknown command: " ++ command
   where
     unchanged session response = pure (Just session, response, False)
     selected session extra = do
       fields <- stateFields session
-      unchanged session $ success (fields ++ extra)
+      unchanged session (fields ++ extra)
 
 atIndex :: Int -> [a] -> Maybe a
 atIndex i _ | i < 0 = Nothing

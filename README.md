@@ -98,9 +98,10 @@ from tamarin_cli import TamarinClient
 with TamarinClient() as client:
     client.load("theory.spthy")
     client.lemma("secrecy")
-    methods = client.methods()["methods"]
-    # Inspect methods before explicitly calling client.apply(method_id).
-    print(methods)
+    listing = client.methods()
+    print(listing["methods"])
+    # After choosing a method ID, apply using this listing's revision:
+    # client.apply(method_id, revision=listing["revision"])
     client.save("partial.spthy")
 ```
 
@@ -108,6 +109,31 @@ Every client operation returns a response dictionary. Backend command errors
 raise `BackendError` without replacing the session. `request(command, **fields)`
 exposes the underlying protocol for scripting. The synchronous client owns one
 backend process; use a context manager or `close()` to release it.
+
+Method application requires an explicit revision:
+`client.apply(method_id, revision=listing["revision"])`. Use the revision from
+the response containing the methods you selected from, not a later revision.
+`client.revision` reports the latest observed revision for inspection; it is
+`None` before the first reply. Raw `apply` and `step` requests require
+`expected_revision`. Missing or stale tokens raise `BackendError` without
+changing the proof, cursor, history, or revision. Refresh `state` or `methods`
+and reconsider the choice rather than automatically retrying an old index.
+
+Every response includes a monotonic integer `revision`. Successful load,
+lemma selection, branch navigation, apply, reset, undo, redo, and check advance
+it; errors and read-only inspection/save do not. Undo/redo never restore old
+revision numbers, and reload does not reset the counter. Tokens are local to
+one backend process and are not proof-storage data.
+
+The REPL supplies the revision belonging to the methods it displays.
+After `check`, refresh with `methods` or `state` before applying another step.
+Backend startup, transport, and protocol failures end the REPL with a nonzero
+exit status and a warning about unsaved work; ordinary command errors remain
+recoverable. The backend is never restarted automatically. To preserve readline
+history and completion, an idle backend exit is detected on the next command,
+not by interrupting an input prompt. In-flight requests detect a closed stream
+immediately. Python callers receive `ProtocolError` or `ClientClosedError`
+and must explicitly open a new client session to continue.
 
 The backend can be used directly with
 `stack exec --no-install-ghc -- tamarin-prover proof-api`. It accepts one JSON

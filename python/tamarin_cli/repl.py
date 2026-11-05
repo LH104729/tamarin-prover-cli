@@ -8,7 +8,14 @@ import shlex
 import sys
 from typing import Any, Dict, Optional, Sequence, TextIO
 
-from .client import TamarinClient, TamarinError
+from .client import (
+    BackendError,
+    BackendUnavailableError,
+    ClientClosedError,
+    ProtocolError,
+    TamarinClient,
+    TamarinError,
+)
 
 
 class TamarinShell(cmd.Cmd):
@@ -27,16 +34,23 @@ class TamarinShell(cmd.Cmd):
         super().__init__(stdin=stdin, stdout=stdout)
         self.client = client
         self.current_node_id: Optional[str] = None
+        self.displayed_revision: Optional[int] = None
         if stdin is not None:
             self.use_rawinput = False
 
     def emptyline(self) -> None:
         """Never repeat a previous command, especially a proof mutation."""
 
+    def preloop(self) -> None:
+        # Preserve readline's normal blocking input. An idle backend death is
+        # detected on the next command, not by interrupting the input prompt.
+        self.client.check_alive()
+
     def onecmd(self, line: str) -> bool:
+        self.client.check_alive()
         try:
             return bool(super().onecmd(line))
-        except (TamarinError, ValueError, OSError) as exc:
+        except (BackendError, ValueError, OSError) as exc:
             self._print(f"Error: {exc}")
             return False
 
@@ -101,6 +115,7 @@ class TamarinShell(cmd.Cmd):
         show_branches: bool = True,
     ) -> None:
         self.current_node_id = response["node_id"]
+        self.displayed_revision = response["revision"]
         self._print(
             f"Lemma: {response['lemma']} | Node: {response['node_id']} "
             f"| Status: {response['branch_status']}"
@@ -118,6 +133,7 @@ class TamarinShell(cmd.Cmd):
         """Load one file, also used by the optional initial command-line file."""
         response = self.client.load(file)
         self.current_node_id = None
+        self.displayed_revision = None
         self._print(f"Loaded theory: {response['theory']} ({response['file']})")
         self._show_lemmas(response)
 
@@ -162,16 +178,24 @@ class TamarinShell(cmd.Cmd):
         Listing methods never executes them. Use apply <id> to choose one.
         """
         self._arguments(argument, 0, "methods")
-        self._show_items("Methods", self.client.methods()["methods"])
+        response = self.client.methods()
+        self.displayed_revision = response["revision"]
+        self._show_items("Methods", response["methods"])
 
     def do_apply(self, argument: str) -> None:
         """apply <id>: Apply exactly one explicitly selected proof method.
 
-        IDs refer to the current node's methods list and may change after a step.
+        IDs refer to the displayed methods list and its backend revision.
         A sole generated child is entered automatically without applying more
         methods. For multiple children, choose one with branch <id>.
         """
-        response = self.client.apply(self._id(argument, "apply <id>"))
+        method_id = self._id(argument, "apply <id>")
+        if self.displayed_revision is None:
+            raise ValueError(
+                "No methods revision displayed; select a lemma or run methods "
+                "before applying a method"
+            )
+        response = self.client.apply(method_id, revision=self.displayed_revision)
         self._print(f"Applied: {response['applied']} (node {response['applied_at']})")
         generated = response["generated_branches"]
         self._show_branches({"branches": generated}, title="Generated branches")
@@ -265,6 +289,7 @@ class TamarinShell(cmd.Cmd):
         """
         self._arguments(argument, 0, "check")
         response = self.client.check()
+        self.displayed_revision = None
         self._print(f"{response['lemma']}: {response['result']}")
         if response.get("message"):
             self._print(str(response["message"]))
@@ -340,10 +365,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if arguments.file:
                 try:
                     shell.load_file(arguments.file)
-                except (TamarinError, ValueError, OSError) as exc:
+                except (BackendError, ValueError, OSError) as exc:
                     shell._print(f"Error: {exc}")
             shell.cmdloop()
         return 0
+    except (ProtocolError, ClientClosedError, BackendUnavailableError) as exc:
+        print(
+            f"Backend session unavailable or ended: {exc}\n"
+            "Unsaved work may have been lost. Exiting without automatically "
+            "restarting the backend.",
+            file=sys.stderr,
+        )
+        return 1
     except TamarinError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

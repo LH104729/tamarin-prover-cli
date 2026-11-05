@@ -5,11 +5,12 @@ Example::
     with TamarinClient() as client:
         client.load("example.spthy")
         client.lemma("secrecy")
-        print(client.methods())
-        client.apply(0)  # Only an explicit call applies a proof method.
+        listing = client.methods()
+        print(listing["methods"])
+        client.apply(0, revision=listing["revision"])  # Explicit method choice.
         client.save("example-partial.spthy")
 
-Every command returns the backend response dictionary, including ``status``.
+Every command returns a dictionary including ``status`` and ``revision``.
 Backend command errors raise BackendError without ending the session. Instances
 are synchronous and should not be shared between concurrent callers.
 """
@@ -113,6 +114,28 @@ class TamarinClient:
         self._stderr = stderr
         self._process: Optional[subprocess.Popen[str]] = None
         self._closed = False
+        self._revision: Optional[int] = None
+
+    @property
+    def revision(self) -> Optional[int]:
+        """Latest observed backend revision, or None before the first reply.
+
+        Apply using the revision attached to the method list you selected from,
+        not a later value of this property.
+        """
+        return self._revision
+
+    def check_alive(self) -> None:
+        """Check an existing child without starting or restarting a session."""
+        if self._closed:
+            raise ClientClosedError("The backend session is closed")
+        if self._process is not None:
+            returncode = self._process.poll()
+            if returncode is not None:
+                self._shutdown(send_quit=False)
+                raise ProtocolError(
+                    f"Backend exited (exit status {returncode}); see stderr for diagnostics"
+                )
 
     def __enter__(self) -> TamarinClient:
         return self.start()
@@ -171,6 +194,11 @@ class TamarinClient:
         if not isinstance(response, dict) or response.get("status") not in ("success", "error"):
             self._shutdown(send_quit=False)
             raise ProtocolError(f"Backend returned an invalid response: {response!r}")
+        revision = response.get("revision")
+        if type(revision) is not int or revision < 0:
+            self._shutdown(send_quit=False)
+            raise ProtocolError("Backend response has no valid session revision")
+        self._revision = revision
         if response["status"] == "error":
             raise BackendError(response)
         return response
@@ -199,13 +227,15 @@ class TamarinClient:
         """List applicable methods; IDs are local to the selected node."""
         return self.request("methods")
 
-    def apply(self, method_id: int) -> Dict[str, Any]:
+    def apply(self, method_id: int, *, revision: int) -> Dict[str, Any]:
         """Apply one method; enter its sole child, or stay for a branch choice.
 
         ``generated_branches`` describes the applied node's children; ordinary
         state fields describe the resulting cursor. No further methods run.
+        Pass the revision from the response containing the selected method.
+        Stale or missing revisions are rejected without changing the proof.
         """
-        return self.request("apply", method_id=method_id)
+        return self.request("apply", method_id=method_id, expected_revision=revision)
 
     def branches(self) -> Dict[str, Any]:
         """List the selected node's immediate child branches."""
