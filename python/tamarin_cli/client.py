@@ -200,7 +200,11 @@ class TamarinClient:
         return self.request("methods")
 
     def apply(self, method_id: int) -> Dict[str, Any]:
-        """Apply one explicitly selected method (a local zero-based ID)."""
+        """Apply one method; enter its sole child, or stay for a branch choice.
+
+        ``generated_branches`` describes the applied node's children; ordinary
+        state fields describe the resulting cursor. No further methods run.
+        """
         return self.request("apply", method_id=method_id)
 
     def branches(self) -> Dict[str, Any]:
@@ -216,8 +220,16 @@ class TamarinClient:
         return self.request("back")
 
     def undo(self) -> Dict[str, Any]:
-        """Ask Tamarin to undo the current proof step."""
+        """Reverse the last proof mutation, restoring its theory and cursor."""
         return self.request("undo")
+
+    def redo(self) -> Dict[str, Any]:
+        """Restore the last undone mutation without re-executing its method."""
+        return self.request("redo")
+
+    def reset(self) -> Dict[str, Any]:
+        """Replace the selected step and its descendants with native sorry."""
+        return self.request("reset")
 
     def tree(self) -> Dict[str, Any]:
         """Return the complete backend-owned proof tree for the selected lemma."""

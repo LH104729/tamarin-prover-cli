@@ -38,10 +38,11 @@ The REPL supports:
 | Commands (shortcuts) | Operation |
 | --- | --- |
 | `load` (`ld`), `lemmas` (`ls`), `lemma` (`l`) | Load a native theory; list, select, or resume lemmas |
-| `state` (`s`), `goals` (`g`), `methods` (`m`) | Inspect constraints, facts, open goals, and applicable methods |
+| `state [full]` (`s [full]`), `goals` (`g`), `methods` (`m`) | Show a compact summary or full native state; list goals or methods |
 | `apply <id>` (`a <id>`) | Execute exactly one explicitly selected engine proof method |
 | `branches` (`bs`), `branch <id>` (`b <id>`), `back` (`p`) | Inspect children, select one, or return to its parent |
-| `undo` (`u`) | Replace the selected step and descendants with `sorry` |
+| `undo` (`u`), `redo` (`r`) | Reverse the last proof mutation or restore it |
+| `reset` | Replace the selected step and descendants with `sorry` |
 | `tree` (`t`) | Display the selected lemma's complete proof tree |
 | `save` (`w`), `check` (`c`) | Save native `.spthy`; replay recorded steps and report proof completeness |
 | `help` (`h`), `quit` (`q`) | Command help; exit without automatically saving |
@@ -50,12 +51,24 @@ Shortcuts accept the same arguments as their full commands, for example
 `ld "my theory.spthy"`, `l secrecy`, `a 0`, or `w "partial proof.spthy"`.
 `help` lists shortcuts; `help a` (or `h a`) shows help for `apply`.
 
-Method and branch IDs are local, zero-based indices. Applying a method leaves
-the cursor at its node; use `branches` and `branch <id>` to inspect resulting
-states. Switch siblings with `back`, then `branch <id>`. Lemma switches retain
-each lemma's tree and cursor. `undo` at an unfinished leaf resets the nearest
-applied ancestor; it discards that step's subtree. Undo before replacing an
-existing step. Empty lines never repeat proof commands.
+State output is compact by default: lemma, node, status, goal count, applicable
+methods, and child branches. Use `state full` (or `s full`) for the complete
+native constraint system. `goals` and `methods` list those items separately.
+
+Method and branch IDs are local, zero-based indices. `apply` reports generated
+branches and enters a sole child automatically, without executing another proof
+method. For multiple children it stays at the parent; use `b <id>` to choose.
+Unnamed children are displayed as `(continuation)`. Switch siblings with `back`,
+then `branch <id>`. Lemma switches retain each lemma's tree and cursor.
+
+`undo` reverses the last successful `apply` or `reset`, even after navigating or
+switching lemmas. `redo` restores the exact resulting proof and selection without
+re-executing a method. Navigation, selection, checking, and saving do not create
+history entries. A new successful mutation clears redo; failed commands do not.
+`reset` explicitly discards only the selected subtree, never an ancestor.
+An already-empty `sorry` cannot be reset. Undo can restore a reset subtree.
+History is session-only and is cleared by a successful `load`, not persisted in
+`.spthy`. Empty lines never repeat proof commands.
 
 Loading another theory explicitly replaces the session; save first to retain
 edits. Quote paths containing spaces. `quit`, EOF, and Ctrl-C do not save
@@ -103,6 +116,9 @@ to stderr. Requests use `command` and, where needed, `file`, `name`,
 `method_id`, or `branch_id`. Command names match the REPL. Responses have
 `status: "success"` or `status: "error"` with a `message`; current-node status
 is `branch_status`. Trees and branches expose numeric-path `node_id` values.
+On `apply`, `applied_at` identifies the node where the method ran and
+`generated_branches` lists its resulting children. The ordinary state fields
+describe the resulting cursor, including automatic single-child navigation.
 Persistent proof files are exclusively native `.spthy`, never JSON.
 
 Run the real-engine integration regressions after building:

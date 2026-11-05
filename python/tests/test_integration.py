@@ -57,7 +57,6 @@ class ProofIntegrationTests(unittest.TestCase):
     def split(self, lemma):
         self.client.lemma(lemma)
         self.step("simplify")
-        self.client.branch(0)
         return self.step("solve(")
 
     def test_manual_navigation_undo_and_native_round_trip(self):
@@ -70,7 +69,6 @@ class ProofIntegrationTests(unittest.TestCase):
         self.assertEqual(self.client.tree()["tree"], initial)
 
         self.step("simplify")
-        self.client.branch(0)
         # Simplify must not silently select and solve the remaining goal.
         self.assertEqual(self.client.tree()["tree"]["children"][0]["method"], "sorry")
         self.assertTrue(any("Pick" in goal["text"] for goal in self.client.goals()["goals"]))
@@ -86,11 +84,16 @@ class ProofIntegrationTests(unittest.TestCase):
         self.client.back()
         self.client.branch(right["id"])
         self.assertIn("right", self.client.state()["state"])
+        self.client.reset()
+        partial = self.client.tree()
         shell = TamarinShell(self.client, stdout=io.StringIO())
         shell.onecmd("undo")
+        self.assertEqual(self.client.check()["result"], "verified")
         undone = self.client.tree()
         shell.onecmd("")
         self.assertEqual(self.client.tree(), undone)
+        self.client.redo()
+        self.assertEqual(self.client.tree(), partial)
         self.assertEqual(self.client.check()["result"], "incomplete")
         retained = self.client.tree()["tree"]
         self.assertEqual(retained["status"], "open")
@@ -146,7 +149,6 @@ class ProofIntegrationTests(unittest.TestCase):
     def test_errors_are_transactional(self):
         self.client.lemma("witness")
         self.step("simplify")
-        self.client.branch(0)
         before = self.client.tree()
         state = self.client.state()
         for operation in [
@@ -180,6 +182,57 @@ class ProofIntegrationTests(unittest.TestCase):
         self.assertEqual(self.client.tree(), before)
         self.client.lemma("unique")
         self.assertEqual(self.client.check()["result"], "verified")
+
+    def test_history_restores_mutations_across_navigation_and_lemmas(self):
+        self.client.lemma("witness")
+        first = self.step("simplify")
+        self.assertEqual(first["applied_at"], "0")
+        self.assertEqual(first["node_id"], first["generated_branches"][0]["node_id"])
+        self.assertTrue(first["methods"])  # No follow-up solve was executed.
+        simplified = self.client.tree()
+        split = self.step("solve(")
+        self.assertEqual(split["node_id"], split["applied_at"])
+        completed = self.client.tree()
+        self.client.lemma("safety")
+        self.step("induction")
+        induction = self.client.tree()
+        self.client.lemma("witness")
+        self.client.back()
+        self.client.check()
+        self.client.save(self.root / "history.spthy")
+
+        restored = self.client.undo()
+        self.assertEqual(restored["lemma"], "safety")
+        self.assertEqual(restored["node_id"], "0")
+        self.assertFalse(self.client.tree()["tree"]["children"])
+        restored = self.client.undo()
+        self.assertEqual(restored["lemma"], "witness")
+        self.assertEqual(restored["node_id"], first["node_id"])
+        self.assertEqual(self.client.tree(), simplified)
+        self.client.redo()
+        self.assertEqual(self.client.tree(), completed)
+        self.client.redo()
+        self.assertEqual(self.client.tree(), induction)
+
+        self.client.reset()
+        cleared = self.client.tree()
+        self.assertFalse(cleared["tree"]["children"])
+        self.client.undo()
+        self.assertEqual(self.client.tree(), induction)
+        with self.assertRaises(BackendError):
+            self.client.apply(999)
+        self.client.redo()  # A failed mutation must not discard redo.
+        self.assertEqual(self.client.tree(), cleared)
+        self.client.undo()
+        self.client.reset()  # A successful alternative mutation discards redo.
+        with self.assertRaises(BackendError):
+            self.client.redo()
+        with self.assertRaises(BackendError):
+            self.client.reset()  # Empty sorry has no subtree to discard.
+        self.client.load(self.file)
+        for operation in (self.client.undo, self.client.redo):
+            with self.assertRaises(BackendError):
+                operation()
 
 
 if __name__ == "__main__":

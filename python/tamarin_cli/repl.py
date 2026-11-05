@@ -80,30 +80,39 @@ class TamarinShell(cmd.Cmd):
         if not items:
             self._print("  (none)")
 
-    def _show_branches(self, response: Dict[str, Any]) -> None:
+    def _show_branches(
+        self, response: Dict[str, Any], *, title: str = "Branches"
+    ) -> None:
         branches = response.get("branches", [])
-        self._print("Branches:")
+        self._print(f"{title}:")
         for branch in branches:
             self._print(
-                f"  [{branch['id']}] {branch['name']} "
+                f"  [{branch['id']}] {branch['name'] or '(continuation)'} "
                 f"[{branch['status']}] (node {branch['node_id']})"
             )
         if not branches:
             self._print("  (none)")
 
-    def _show_state(self, response: Dict[str, Any]) -> None:
+    def _show_state(
+        self,
+        response: Dict[str, Any],
+        *,
+        full: bool = False,
+        show_branches: bool = True,
+    ) -> None:
         self.current_node_id = response["node_id"]
-        if response.get("applied") is not None:
-            self._print(f"Applied: {response['applied']}")
         self._print(
             f"Lemma: {response['lemma']} | Node: {response['node_id']} "
             f"| Status: {response['branch_status']}"
         )
-        state = response.get("state", "")
-        self._print(str(state) if state else "(No further proof-state details.)")
-        self._show_items("Goals", response.get("goals", []))
-        self._show_items("Methods", response.get("methods", []))
-        self._show_branches(response)
+        if full:
+            state = response.get("state", "")
+            self._print(str(state) if state else "(No further proof-state details.)")
+        self._print(f"Goals: {len(response.get('goals', []))}")
+        if response.get("methods"):
+            self._show_items("Methods", response["methods"])
+        if show_branches and response.get("branches"):
+            self._show_branches(response)
 
     def load_file(self, file: str) -> None:
         """Load one file, also used by the optional initial command-line file."""
@@ -131,9 +140,16 @@ class TamarinShell(cmd.Cmd):
         self._show_state(self.client.lemma(name))
 
     def do_state(self, argument: str) -> None:
-        """state: Show current constraints, facts, goals, methods, and branches."""
-        self._arguments(argument, 0, "state")
-        self._show_state(self.client.state())
+        """state [full]: Show a compact summary, or the full native proof state.
+
+        Use goals or methods to list those items individually.
+        """
+        arguments = shlex.split(argument)
+        if arguments not in ([], ["full"]):
+            raise ValueError(
+                "Usage: state [full]; quote paths or names containing spaces"
+            )
+        self._show_state(self.client.state(), full=bool(arguments))
 
     def do_goals(self, argument: str) -> None:
         """goals: List open goals at the current proof node."""
@@ -152,8 +168,18 @@ class TamarinShell(cmd.Cmd):
         """apply <id>: Apply exactly one explicitly selected proof method.
 
         IDs refer to the current node's methods list and may change after a step.
+        A sole generated child is entered automatically without applying more
+        methods. For multiple children, choose one with branch <id>.
         """
-        self._show_state(self.client.apply(self._id(argument, "apply <id>")))
+        response = self.client.apply(self._id(argument, "apply <id>"))
+        self._print(f"Applied: {response['applied']} (node {response['applied_at']})")
+        generated = response["generated_branches"]
+        self._show_branches({"branches": generated}, title="Generated branches")
+        if len(generated) == 1:
+            self._print(f"Auto-entered sole child: node {response['node_id']}")
+        elif len(generated) > 1:
+            self._print("Choose a branch with b <id>.")
+        self._show_state(response, show_branches=len(generated) <= 1)
 
     def do_branches(self, argument: str) -> None:
         """branches: List immediate child branches, their IDs, and statuses."""
@@ -173,9 +199,29 @@ class TamarinShell(cmd.Cmd):
         self._show_state(self.client.back())
 
     def do_undo(self, argument: str) -> None:
-        """undo: Undo the current proof step and display the resulting state."""
+        """undo: Undo the last apply/reset mutation, restoring its prior selection.
+
+        History spans the session; navigation alone is not a mutation.
+        """
         self._arguments(argument, 0, "undo")
         self._show_state(self.client.undo())
+
+    def do_redo(self, argument: str) -> None:
+        """redo: Restore the last undone mutation and its resulting selection.
+
+        A new successful apply or reset clears redo history.
+        """
+        self._arguments(argument, 0, "redo")
+        self._show_state(self.client.redo())
+
+    def do_reset(self, argument: str) -> None:
+        """reset: Replace the selected proof subtree with an unfinished step.
+
+        Resets this node and its descendants, never an ancestor. Use undo to
+        restore the subtree; resetting an already-empty unfinished node fails.
+        """
+        self._arguments(argument, 0, "reset")
+        self._show_state(self.client.reset())
 
     def do_tree(self, argument: str) -> None:
         """tree: Display the complete hierarchical proof tree for this lemma."""
@@ -189,7 +235,8 @@ class TamarinShell(cmd.Cmd):
             marker = " *" if node["node_id"] == self.current_node_id else ""
             method = f" — {node['method']}" if node.get("method") else ""
             self._print(
-                f"{prefix}{connector}{node['node_id']} {node['name']}{method} "
+                f"{prefix}{connector}{node['node_id']} "
+                f"{node['name'] or '(continuation)'}{method} "
                 f"[{node['status']}]{marker}"
             )
             children = node.get("children", [])
@@ -241,7 +288,8 @@ class TamarinShell(cmd.Cmd):
             self._print(
                 "Shortcuts: ld=load, ls=lemmas, l=lemma, s=state, g=goals,\n"
                 "           m=methods, a=apply, bs=branches, b=branch, p=back,\n"
-                "           u=undo, t=tree, w=save, c=check, h=help, q=quit"
+                "           u=undo, r=redo, t=tree, w=save, c=check, h=help, q=quit\n"
+                "           reset has no single-letter shortcut"
             )
 
     # cmd.Cmd discovers these aliases for dispatch, help, and tab completion.
@@ -256,6 +304,7 @@ class TamarinShell(cmd.Cmd):
     do_b = do_branch
     do_p = do_back
     do_u = do_undo
+    do_r = do_redo
     do_t = do_tree
     do_w = do_save
     do_c = do_check

@@ -37,7 +37,17 @@ data Session = Session
   , selectedLemma :: Maybe String
   , cursors :: M.Map String ProofPath
   , cachedMethods :: [ProofMethod]
+  , undoHistory :: [Mutation]
+  , redoHistory :: [Mutation]
   }
+
+-- History contains only immutable engine/view state, never another Session or
+-- its history stacks. Native theories and proofs are shared, not copied.
+-- Strict fields also prevent selector thunks from retaining an old Session.
+data Snapshot = Snapshot
+  !ClosedTheory !(Maybe String) !(M.Map String ProofPath) ![ProofMethod]
+
+data Mutation = Mutation !Snapshot !Snapshot
 
 data Request = Request String (Maybe String) (Maybe Int)
 
@@ -142,7 +152,7 @@ dispatch opts previous (Request command text index)
             hPutStrLn stderr $ "WARNING: theory wellformedness checks failed:\n"
               ++ render (prettyWfErrorReport warnings)
           pure t
-      let session = Session original thy Nothing M.empty []
+      let session = Session original thy Nothing M.empty [] [] []
       pure (Just session, success
         ["theory" .= L.get thyName thy, "file" .= file, "lemmas" .= lemmaValues thy], False)
   | otherwise = do
@@ -185,7 +195,7 @@ dispatch opts previous (Request command text index)
         "apply" -> do
           (name, proof, path, node) <- selection session
           unless (isSorry node && M.null (children node)) $
-            apiError "This node already contains a proof step or retained subproof; use undo before replacing it"
+            apiError "This node already contains a proof step or retained subproof; use reset before replacing it"
           i <- require "Missing method_id" index
           method <- require "Invalid method index" $ atIndex i (cachedMethods session)
           sys <- require "No annotated proof state at this node" $ psInfo (root node)
@@ -193,18 +203,39 @@ dispatch opts previous (Request command text index)
           let ctxt = getProofContext lemma (currentTheory session)
           proof' <- require "The selected proof method failed" $
             modifyAtPath (runProver (oneStepProver method) ctxt (length path) sys) path proof
-          next <- installProof session name proof'
-          selected next ["applied" .= render (prettyProofMethod method)]
-        "undo" -> do
-          (name, proof, path, _) <- selection session
-          -- Reset this step and all descendants. On an unfinished sorry leaf,
-          -- undo the nearest applied ancestor instead (and move the cursor).
-          target <- require "There is no applied proof step to undo" $ undoTarget proof path
+          installed <- installProof session name proof'
+          (_, installedProof, _, appliedNode) <- selection installed
+          let generated = branchValues installedProof path appliedNode
+          navigated <- case M.toList (children appliedNode) of
+            [(caseName, _)] -> refresh installed
+              { cursors = M.insert name (path ++ [caseName]) (cursors installed) }
+            _ -> pure installed
+          let next = rememberMutation session navigated
+          selected next
+            [ "applied" .= render (prettyProofMethod method)
+            , "applied_at" .= nodeId installedProof path
+            , "generated_branches" .= generated
+            ]
+        "undo" -> case undoHistory session of
+          [] -> apiError "There is no mutation to undo"
+          change@(Mutation before _) : rest -> do
+            let next = (restoreSnapshot before session)
+                  { undoHistory = rest, redoHistory = change : redoHistory session }
+            selected next []
+        "redo" -> case redoHistory session of
+          [] -> apiError "There is no mutation to redo"
+          change@(Mutation _ after) : rest -> do
+            let next = (restoreSnapshot after session)
+                  { undoHistory = change : undoHistory session, redoHistory = rest }
+            selected next []
+        "reset" -> do
+          (name, proof, path, node) <- selection session
+          when (isSorry node && M.null (children node)) $
+            apiError "This node is already an empty sorry"
           proof' <- require "Invalid proof path" $
-            modifyAtPath (\p -> Just $ sorry Nothing (psInfo (root p))) target proof
-          next <- installProof session
-            { cursors = M.insert name target (cursors session) } name proof'
-          selected next []
+            modifyAtPath (\p -> Just $ sorry Nothing (psInfo (root p))) path proof
+          installed <- installProof session name proof'
+          selected (rememberMutation session installed) []
         "tree" -> do
           (name, proof, _, _) <- selection session
           unchanged session $ success ["lemma" .= name, "tree" .= treeValue "0" name proof]
@@ -278,12 +309,21 @@ isSorry node = case psMethod (root node) of
   Sorry _ -> True
   _ -> False
 
-undoTarget :: IncrementalProof -> ProofPath -> Maybe ProofPath
-undoTarget proof path = do
-  node <- atPath proof path
-  if not (isSorry node) || not (M.null (children node))
-    then Just path
-    else if null path then Nothing else undoTarget proof (init path)
+snapshot :: Session -> Snapshot
+snapshot session = Snapshot (currentTheory session) (selectedLemma session)
+  (cursors session) (cachedMethods session)
+
+restoreSnapshot :: Snapshot -> Session -> Session
+restoreSnapshot (Snapshot thy lemma paths methods) session = session
+  { currentTheory = thy, selectedLemma = lemma, cursors = paths
+  , cachedMethods = methods
+  }
+
+rememberMutation :: Session -> Session -> Session
+rememberMutation before after =
+  let change = Mutation (snapshot before) (snapshot after)
+  in change `seq` after
+    { undoHistory = change : undoHistory before, redoHistory = [] }
 
 nodeId :: IncrementalProof -> ProofPath -> String
 nodeId proof = go "0" proof
