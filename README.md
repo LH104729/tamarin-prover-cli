@@ -39,9 +39,11 @@ The REPL supports:
 | --- | --- |
 | `load` (`ld`), `lemmas` (`ls`), `lemma` (`l`) | Load a native theory; list, select, or resume lemmas |
 | `state [full]` (`s [full]`), `goals` (`g`), `methods` (`m`) | Show a compact summary or full native state; list goals or methods |
-| `apply <id>` (`a <id>`) | Execute exactly one explicitly selected engine proof method |
+| `observe [--detail compact\|goals\|full] [--json]` | Request structured observations at the chosen detail level |
+| `apply <id> [--timeout-ms N]` (`a <id> [--timeout-ms N]`) | Execute one selected method, optionally bounded by a positive millisecond timeout |
 | `auto [k]` | Search the selected subtree with up to `k` method applications, or without a limit |
 | `branches` (`bs`), `branch <id>` (`b <id>`), `back` (`p`) | Inspect children, select one, or return to its parent |
+| `frontier`, `goto <node_id>` | List unfinished leaves across the selected lemma; navigate directly to a revision-local node |
 | `undo` (`u`), `redo` (`r`) | Reverse the last proof mutation or restore it |
 | `reset` | Replace the selected step and descendants with `sorry` |
 | `tree` (`t`) | Display the selected lemma's complete proof tree |
@@ -52,15 +54,31 @@ Shortcuts accept the same arguments as their full commands, for example
 `ld "my theory.spthy"`, `l secrecy`, `a 0`, or `w "partial proof.spthy"`.
 `help` lists shortcuts; `help a` (or `h a`) shows help for `apply`.
 
-State output is compact by default: lemma, node, status, goal count, applicable
-methods, and child branches. Use `state full` (or `s full`) for the complete
-native constraint system. `goals` and `methods` list those items separately.
+State responses are compact by default at the backend, not merely shortened by
+the terminal: lemma, node, status, goal count, methods, child count, and branches.
+`observe --detail goals` adds detailed goals and relevant formulas, equations,
+subterms, ordering constraints, and the last-node constraint. `state full` or
+`observe --detail full` additionally renders the complete native constraint
+system. Compact and goals observations never render the full system.
+`observe --detail compact --json` prints the backend response as JSON within the
+existing REPL session. `goals` and `methods` list those items separately.
+
+Methods include `id`, `text`, `name`, and `kind`. A goal-solving method also has
+`goal_id`, matching the `goal_id` of its detailed goal (`g0`, `g1`, ...).
+Goal and method IDs are local to the current node and revision.
 
 Method and branch IDs are local, zero-based indices. `apply` reports generated
 branches and enters a sole child automatically, without executing another proof
 method. For multiple children it stays at the parent; use `b <id>` to choose.
 Unnamed children are displayed as `(continuation)`. Switch siblings with `back`,
 then `branch <id>`. Lemma switches retain each lemma's tree and cursor.
+
+`frontier` lists unfinished `sorry` leaves in the entire selected lemma,
+excluding completed branches and internal nodes. `goto 0.1.0` selects a node
+directly without applying a method. Node IDs use canonical zero-based decimal
+paths rooted at `0`; `goto` requires the revision of the node listing. The REPL
+tracks it from observations, branches, tree, and frontier output. Refresh a
+listing after a state change; stale node references are rejected.
 
 `undo` reverses the last successful `apply`, `auto`, or `reset`, even after
 navigating or switching lemmas. A completed `auto` run is one undo entry.
@@ -82,10 +100,17 @@ may not terminate. Press **Ctrl-C during auto** to cancel it and return to the
 prompt: like the GUI's Cancel action, the entire running operation is discarded,
 preserving the pre-auto proof, selection, and undo/redo history.
 
+Individual `apply` steps are also cancellable with **Ctrl-C**.
+`apply 0 --timeout-ms 5000` bounds the entire operation, including proof replay,
+method ranking, and response preparation. Timeout and cancellation discard the
+candidate completely: proof, cursor, revision, and undo/redo history remain
+unchanged. They report structured `TIMEOUT` or `CANCELLED` errors and leave the
+session usable. No timeout is imposed when omitted.
+
 Loading another theory explicitly replaces the session; save first to retain
-edits. Quote paths containing spaces. `quit`, EOF, and Ctrl-C outside `auto` do
-not save automatically; Ctrl-C outside `auto` exits. Readline command history
-is available within the session.
+edits. Quote paths containing spaces. `quit`, EOF, and Ctrl-C outside `auto` or
+`apply` do not save automatically; Ctrl-C outside those operations exits.
+Readline command history is available within the session.
 
 Proof construction reuses Tamarin's native methods, including simplification,
 induction, and constraint solving. The engine may immediately recognize terminal
@@ -116,6 +141,8 @@ with TamarinClient() as client:
     print(listing["methods"])
     # After choosing a method ID, apply using this listing's revision:
     # client.apply(method_id, revision=listing["revision"])
+    # Compact by default; request client.observe("goals") or ("full") on demand.
+    # client.apply(method_id, revision=listing["revision"], timeout_ms=5000)
     # Or explicitly request search: client.auto(10), or client.auto() unbounded.
     client.save("partial.spthy")
 ```
@@ -127,6 +154,10 @@ backend process; use a context manager or `close()` to release it.
 `client.auto(steps=None)` runs cancellable search on the main thread; a
 non-negative integer limits method applications. Its response includes
 `auto_steps` and `auto_reason` (`step_limit`, `finished`, or `cancelled`).
+`apply`, its raw `step` alias, and `auto` must run on the main thread for Ctrl-C
+handling. The existing client exposes `observe(detail="compact")`,
+`state(detail="compact")`, `frontier()`, and `goto(node_id, revision=...)`.
+Use the revision from `frontier` or `tree` when selecting one of its node IDs.
 
 Method application requires an explicit revision:
 `client.apply(method_id, revision=listing["revision"])`. Use the revision from
@@ -138,14 +169,16 @@ changing the proof, cursor, history, or revision. Refresh `state` or `methods`
 and reconsider the choice rather than automatically retrying an old index.
 
 Every response includes a monotonic integer `revision`. Successful load,
-lemma selection, branch navigation, apply, reset, undo, redo, and check advance
+lemma selection, branch navigation, goto, apply, reset, undo, redo, and check advance
 it, as does an auto run that applies methods; cancelled or zero-step auto runs
-do not. Errors and read-only inspection/save do not advance it. Undo/redo never
+do not. Errors (including timed-out/cancelled apply) and read-only observation,
+frontier, inspection, and save do not advance it. Undo/redo never
 restore old revision numbers, and reload does not reset the counter. Tokens
 are local to one backend process and are not proof-storage data.
 
 The REPL supplies the revision belonging to the methods it displays.
-After `check`, refresh with `methods` or `state` before applying another step.
+After `check`, refresh with `methods` or `state` before applying another step,
+or `tree`/`frontier` before navigating with `goto`.
 Backend startup, transport, and protocol failures end the REPL with a nonzero
 exit status and a warning about unsaved work; ordinary command errors remain
 recoverable. The backend is never restarted automatically. To preserve readline
@@ -158,12 +191,23 @@ The backend can be used directly with
 `stack exec --no-install-ghc -- tamarin-prover proof-api`. It accepts one JSON
 object per input line and emits one response per ordinary request; engine diagnostics go
 to stderr. Requests use `command` and, where needed, `file`, `name`,
-`method_id`, `branch_id`, or `steps`. Command names match the REPL. While `auto`
-is running, send `{"command":"cancel"}` to cancel it. This out-of-band message
-never has its own reply (including when idle); the original `auto` response
-reports cancellation. Responses have `status: "success"` or `status: "error"`
-with a `message`; current-node status is `branch_status`. Trees and branches
-expose numeric-path `node_id` values.
+`method_id`, `branch_id`, `node_id`, `detail`, `timeout_ms`, or `steps`.
+`apply`/`step` and `goto` require `expected_revision`; `timeout_ms`, when present,
+must be a positive integer (not `null`). `observe` and `state` accept `compact`
+(default), `goals`, or `full` detail. Command names match the REPL. While `auto`
+or `apply` is running, send `{"command":"cancel"}` to cancel it. This out-of-band
+message never has its own reply (including when idle); the original operation
+reports cancellation. Auto retains its successful `auto_reason: "cancelled"`
+response; apply returns a `CANCELLED` error.
+
+Responses have `status: "success"` or `status: "error"` and the current
+`revision`; current-node status is `branch_status`. Error responses contain
+`error: {code, message, recoverable, suggested_action}`. Codes include
+`STALE_REVISION`, `INVALID_METHOD`, `INVALID_NODE`, `TIMEOUT`, `CANCELLED`,
+`RESOURCE_LIMIT`, `UNSUPPORTED_THEORY`, `INVALID_REQUEST`, `INVALID_STATE`,
+`IO_ERROR`, and `ENGINE_ERROR`. Python `BackendError` exposes `code`,
+`recoverable`, `suggested_action`, and the complete `response`.
+Trees, branches, and frontier entries expose numeric-path `node_id` values.
 On `apply`, `applied_at` identifies the node where the method ran and
 `generated_branches` lists its resulting children. The ordinary state fields
 describe the resulting cursor, including automatic single-child navigation.

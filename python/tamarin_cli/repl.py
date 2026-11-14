@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import cmd
+import json
 import shlex
 import sys
 from typing import Any, Dict, Optional, Sequence, TextIO
@@ -35,6 +36,7 @@ class TamarinShell(cmd.Cmd):
         self.client = client
         self.current_node_id: Optional[str] = None
         self.displayed_revision: Optional[int] = None
+        self.displayed_node_revision: Optional[int] = None
         if stdin is not None:
             self.use_rawinput = False
 
@@ -50,7 +52,10 @@ class TamarinShell(cmd.Cmd):
         self.client.check_alive()
         try:
             return bool(super().onecmd(line))
-        except (BackendError, ValueError, OSError) as exc:
+        except BackendError as exc:
+            self._show_error(exc)
+            return False
+        except (ValueError, OSError) as exc:
             self._print(f"Error: {exc}")
             return False
 
@@ -59,6 +64,11 @@ class TamarinShell(cmd.Cmd):
 
     def _print(self, text: str = "") -> None:
         print(text, file=self.stdout)
+
+    def _show_error(self, error: BackendError) -> None:
+        self._print(f"Error [{error.code}]: {error}")
+        if error.suggested_action:
+            self._print(f"Suggested action: {error.suggested_action}")
 
     @staticmethod
     def _arguments(argument: str, count: int, usage: str) -> list[str]:
@@ -107,6 +117,11 @@ class TamarinShell(cmd.Cmd):
         if not branches:
             self._print("  (none)")
 
+    def _remember_state(self, response: Dict[str, Any]) -> None:
+        self.current_node_id = response["node_id"]
+        self.displayed_revision = response["revision"]
+        self.displayed_node_revision = response["revision"]
+
     def _show_state(
         self,
         response: Dict[str, Any],
@@ -114,8 +129,7 @@ class TamarinShell(cmd.Cmd):
         full: bool = False,
         show_branches: bool = True,
     ) -> None:
-        self.current_node_id = response["node_id"]
-        self.displayed_revision = response["revision"]
+        self._remember_state(response)
         self._print(
             f"Lemma: {response['lemma']} | Node: {response['node_id']} "
             f"| Status: {response['branch_status']}"
@@ -123,7 +137,7 @@ class TamarinShell(cmd.Cmd):
         if full:
             state = response.get("state", "")
             self._print(str(state) if state else "(No further proof-state details.)")
-        self._print(f"Goals: {len(response.get('goals', []))}")
+        self._print(f"Goals: {response.get('goal_count', len(response.get('goals', [])))}")
         if response.get("methods"):
             self._show_items("Methods", response["methods"])
         if show_branches and response.get("branches"):
@@ -134,6 +148,7 @@ class TamarinShell(cmd.Cmd):
         response = self.client.load(file)
         self.current_node_id = None
         self.displayed_revision = None
+        self.displayed_node_revision = None
         self._print(f"Loaded theory: {response['theory']} ({response['file']})")
         self._show_lemmas(response)
 
@@ -158,14 +173,47 @@ class TamarinShell(cmd.Cmd):
     def do_state(self, argument: str) -> None:
         """state [full]: Show a compact summary, or the full native proof state.
 
-        Use goals or methods to list those items individually.
+        Use goals or methods to list those items, or observe for JSON and details.
         """
         arguments = shlex.split(argument)
         if arguments not in ([], ["full"]):
             raise ValueError(
                 "Usage: state [full]; quote paths or names containing spaces"
             )
-        self._show_state(self.client.state(), full=bool(arguments))
+        detail = "full" if arguments else "compact"
+        self._show_state(self.client.state(detail=detail), full=bool(arguments))
+
+    def do_observe(self, argument: str) -> None:
+        """observe [--detail compact|goals|full] [--json]: Inspect the current node.
+
+        Compact detail shows counts, methods, and branches. Goals detail adds
+        goals and structured constraints; full also includes native state text.
+        JSON prints only the exact backend response, without a summary.
+        """
+        arguments = shlex.split(argument)
+        usage = "Usage: observe [--detail compact|goals|full] [--json]"
+        detail = "compact"
+        as_json = False
+        while arguments:
+            option = arguments.pop(0)
+            if option == "--json" and not as_json:
+                as_json = True
+            elif option == "--detail" and arguments:
+                detail = arguments.pop(0)
+                if detail not in ("compact", "goals", "full"):
+                    raise ValueError(usage)
+            else:
+                raise ValueError(usage)
+        response = self.client.observe(detail=detail)
+        if as_json:
+            self._remember_state(response)
+            self._print(json.dumps(response, ensure_ascii=False))
+            return
+        self._show_state(response, full=detail == "full")
+        if detail in ("goals", "full"):
+            self._show_items("Goals", response["goals"])
+            self._print("Constraints:")
+            self._print(json.dumps(response["constraints"], ensure_ascii=False, indent=2))
 
     def do_goals(self, argument: str) -> None:
         """goals: List open goals at the current proof node."""
@@ -183,19 +231,37 @@ class TamarinShell(cmd.Cmd):
         self._show_items("Methods", response["methods"])
 
     def do_apply(self, argument: str) -> None:
-        """apply <id>: Apply exactly one explicitly selected proof method.
+        """apply <id> [--timeout-ms N]: Apply one explicitly selected proof method.
 
         IDs refer to the displayed methods list and its backend revision.
         A sole generated child is entered automatically without applying more
         methods. For multiple children, choose one with branch <id>.
+        Ctrl-C cancels the operation; a timeout is a positive millisecond limit.
         """
-        method_id = self._id(argument, "apply <id>")
+        arguments = shlex.split(argument)
+        usage = "apply <id> [--timeout-ms N]"
+        if len(arguments) not in (1, 3):
+            raise ValueError(f"Usage: {usage}")
+        method_id = self._id(shlex.join(arguments[:1]), usage)
+        timeout_ms = None
+        if len(arguments) == 3:
+            if arguments[1] != "--timeout-ms":
+                raise ValueError(f"Usage: {usage}")
+            try:
+                timeout_ms = int(arguments[2])
+            except ValueError as exc:
+                raise ValueError("timeout-ms must be a positive integer") from exc
+            if timeout_ms <= 0:
+                raise ValueError("timeout-ms must be a positive integer")
         if self.displayed_revision is None:
             raise ValueError(
                 "No methods revision displayed; select a lemma or run methods "
                 "before applying a method"
             )
-        response = self.client.apply(method_id, revision=self.displayed_revision)
+        parameters = {"revision": self.displayed_revision}
+        if timeout_ms is not None:
+            parameters["timeout_ms"] = timeout_ms
+        response = self.client.apply(method_id, **parameters)
         self._print(f"Applied: {response['applied']} (node {response['applied_at']})")
         generated = response["generated_branches"]
         self._show_branches({"branches": generated}, title="Generated branches")
@@ -243,7 +309,9 @@ class TamarinShell(cmd.Cmd):
     def do_branches(self, argument: str) -> None:
         """branches: List immediate child branches, their IDs, and statuses."""
         self._arguments(argument, 0, "branches")
-        self._show_branches(self.client.branches())
+        response = self.client.branches()
+        self.displayed_node_revision = response["revision"]
+        self._show_branches(response)
 
     def do_branch(self, argument: str) -> None:
         """branch <id>: Select a child using its local zero-based branch ID.
@@ -282,10 +350,45 @@ class TamarinShell(cmd.Cmd):
         self._arguments(argument, 0, "reset")
         self._show_state(self.client.reset())
 
+    def do_goto(self, argument: str) -> None:
+        """goto <node_id>: Select a node from the latest state, tree, or frontier.
+
+        Node IDs are canonical paths such as 0 or 0.1.2 in the selected lemma.
+        Outdated node listings are rejected without changing the selection.
+        """
+        node_id = self._arguments(argument, 1, "goto <node_id>")[0]
+        if self.displayed_node_revision is None:
+            raise ValueError(
+                "No node revision displayed; select a lemma or run tree or "
+                "frontier before navigating"
+            )
+        self._show_state(
+            self.client.goto(node_id, revision=self.displayed_node_revision)
+        )
+
+    def do_frontier(self, argument: str) -> None:
+        """frontier: List unfinished leaf nodes across the selected lemma.
+
+        Use goto <node_id> to select a listed node without applying a method.
+        """
+        self._arguments(argument, 0, "frontier")
+        response = self.client.frontier()
+        self.displayed_node_revision = response["revision"]
+        self._print(f"Frontier: {response['lemma']}")
+        for node in response["frontier"]:
+            self._print(
+                f"  {node['node_id']} [{node['branch_status']}] "
+                f"(goals: {node['goal_count']})"
+            )
+        if not response["frontier"]:
+            self._print("  (none)")
+
     def do_tree(self, argument: str) -> None:
         """tree: Display the complete hierarchical proof tree for this lemma."""
         self._arguments(argument, 0, "tree")
-        root = self.client.tree()["tree"]
+        response = self.client.tree()
+        self.displayed_node_revision = response["revision"]
+        root = response["tree"]
         # An explicit stack also handles proof trees deeper than Python's
         # recursion limit. This is presentation, not construction of proof nodes.
         pending = [(root, "", "", "")]
@@ -325,6 +428,7 @@ class TamarinShell(cmd.Cmd):
         self._arguments(argument, 0, "check")
         response = self.client.check()
         self.displayed_revision = None
+        self.displayed_node_revision = None
         self._print(f"{response['lemma']}: {response['result']}")
         if response.get("message"):
             self._print(str(response["message"]))
@@ -400,7 +504,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if arguments.file:
                 try:
                     shell.load_file(arguments.file)
-                except (BackendError, ValueError, OSError) as exc:
+                except BackendError as exc:
+                    shell._show_error(exc)
+                except (ValueError, OSError) as exc:
                     shell._print(f"Error: {exc}")
             shell.cmdloop()
         return 0

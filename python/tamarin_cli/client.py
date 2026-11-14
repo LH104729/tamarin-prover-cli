@@ -39,7 +39,11 @@ class BackendError(TamarinError):
 
     def __init__(self, response: Dict[str, Any]) -> None:
         self.response = response
-        super().__init__(str(response.get("message", "Backend rejected command")))
+        error = response["error"]
+        self.code: str = error["code"]
+        self.recoverable: bool = error["recoverable"]
+        self.suggested_action: str = error["suggested_action"]
+        super().__init__(str(error["message"]))
 
 
 class BackendUnavailableError(TamarinError):
@@ -159,8 +163,8 @@ class TamarinClient:
                     text=True,
                     encoding="utf-8",
                     bufsize=1,
-                    # Terminal Ctrl-C belongs to the frontend. Auto forwards it
-                    # as protocol cancellation, not a process-killing signal.
+                    # Terminal Ctrl-C belongs to the frontend. Forward it as
+                    # protocol cancellation, not a process-killing signal.
                     start_new_session=True,
                 )
             except OSError as exc:
@@ -172,9 +176,12 @@ class TamarinClient:
 
         Commands are never retried: retrying a mutation could apply it twice.
         A protocol failure closes the client instead of silently losing or
-        replacing the backend's proof session.
+        replacing the backend's proof session. Apply, step, and auto handle
+        Ctrl-C as cancellation and must be called on the main thread.
         """
-        return self._request(command, parameters)
+        return self._request(
+            command, parameters, interruptible=command in ("apply", "step", "auto")
+        )
 
     def _request(
         self, command: str, parameters: Dict[str, Any], *, interruptible: bool = False
@@ -258,9 +265,13 @@ class TamarinClient:
         """Select or resume a named lemma, without applying a method."""
         return self.request("lemma", name=name)
 
-    def state(self) -> Dict[str, Any]:
-        """Return the selected node's constraints, goals, methods, and branches."""
-        return self.request("state")
+    def observe(self, detail: str = "compact") -> Dict[str, Any]:
+        """Inspect the selected node with compact, goals, or full detail."""
+        return self.request("observe", detail=detail)
+
+    def state(self, detail: str = "compact") -> Dict[str, Any]:
+        """Inspect the selected node; request full detail for native state text."""
+        return self.request("state", detail=detail)
 
     def goals(self) -> Dict[str, Any]:
         """List open goals at the selected node."""
@@ -270,15 +281,24 @@ class TamarinClient:
         """List applicable methods; IDs are local to the selected node."""
         return self.request("methods")
 
-    def apply(self, method_id: int, *, revision: int) -> Dict[str, Any]:
+    def apply(
+        self, method_id: int, *, revision: int, timeout_ms: Optional[int] = None
+    ) -> Dict[str, Any]:
         """Apply one method; enter its sole child, or stay for a branch choice.
 
         ``generated_branches`` describes the applied node's children; ordinary
         state fields describe the resulting cursor. No further methods run.
         Pass the revision from the response containing the selected method.
         Stale or missing revisions are rejected without changing the proof.
+        An optional positive timeout is in milliseconds. Ctrl-C cancels the
+        operation; call on the main thread so SIGINT can be handled.
         """
-        return self.request("apply", method_id=method_id, expected_revision=revision)
+        parameters = {"method_id": method_id, "expected_revision": revision}
+        if timeout_ms is not None:
+            if type(timeout_ms) is not int or timeout_ms <= 0:
+                raise ValueError("timeout_ms must be a positive integer or None")
+            parameters["timeout_ms"] = timeout_ms
+        return self.request("apply", **parameters)
 
     def auto(self, steps: Optional[int] = None) -> Dict[str, Any]:
         """Search the selected subtree; None means no method-application limit.
@@ -290,7 +310,7 @@ class TamarinClient:
         if steps is not None and (type(steps) is not int or steps < 0):
             raise ValueError("steps must be a non-negative integer or None")
         parameters = {} if steps is None else {"steps": steps}
-        return self._request("auto", parameters, interruptible=True)
+        return self.request("auto", **parameters)
 
     def branches(self) -> Dict[str, Any]:
         """List the selected node's immediate child branches."""
@@ -319,6 +339,14 @@ class TamarinClient:
     def tree(self) -> Dict[str, Any]:
         """Return the complete backend-owned proof tree for the selected lemma."""
         return self.request("tree")
+
+    def frontier(self) -> Dict[str, Any]:
+        """List unfinished leaf nodes in the selected lemma without navigating."""
+        return self.request("frontier")
+
+    def goto(self, node_id: str, *, revision: int) -> Dict[str, Any]:
+        """Select a node using the revision of its displayed node listing."""
+        return self.request("goto", node_id=node_id, expected_revision=revision)
 
     def save(self, file: Union[str, os.PathLike[str]]) -> Dict[str, Any]:
         """Serialize the current theory and proofs to native .spthy format."""

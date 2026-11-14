@@ -20,6 +20,7 @@ import Data.Monoid (Any (..))
 import Data.Maybe (fromMaybe, isNothing)
 import Data.Sequence (Seq, ViewL (..), (|>))
 import Data.Sequence qualified as Seq
+import Data.Set qualified as S
 import Data.Unique (Unique, newUnique)
 import GHC.IO.Handle (hDuplicate, hDuplicateTo)
 import Main.Console
@@ -29,6 +30,8 @@ import System.Directory (removeFile, renameFile)
 import System.FilePath (takeDirectory, takeFileName)
 import System.IO
 import System.IO.Error (isEOFError)
+import System.Timeout (timeout)
+import Text.Read (readMaybe)
 import Text.PrettyPrint.Class (render)
 import Theory
 import Theory.Constraint.Solver.Goals (openGoals)
@@ -54,8 +57,17 @@ data Snapshot = Snapshot
 
 data Mutation = Mutation !Snapshot !Snapshot
 
+data Detail = Compact | Goals | Full
+
 data Request = Request String (Maybe String) (Maybe Int) (Maybe Integer)
   | AutoRequest (Maybe Integer)
+  | ObserveRequest Detail
+  | ApplyRequest Int Integer (Maybe Int)
+  | GotoRequest String Integer
+
+data APIError = APIError String String Bool String deriving Show
+
+instance Exception APIError
 
 type PreparedResponse = (Maybe Session, Integer, BL.ByteString, Bool)
 
@@ -63,7 +75,7 @@ data APIEvent
   = RequestEvent (Either String Request)
   | InputEnded
   | InputFailed SomeException
-  | AutoCompleted Unique (Either SomeException PreparedResponse)
+  | WorkerCompleted Unique (Either SomeException PreparedResponse)
 
 proofAPIMode :: TamarinMode
 proofAPIMode = tamarinMode "proof-api"
@@ -91,7 +103,7 @@ runAPI _ args = bracket (hDuplicate stdout) hClose $ \protocol -> do
     opts = Loader.defaultTheoryLoadOptions
       { Loader.maudePath = maudePath args }
     -- Only this loop commits sessions and writes protocol responses. The input
-    -- reader stays live while auto evaluates a private, cancellable candidate.
+    -- reader stays live while workers evaluate private, cancellable candidates.
     loop events protocol revision session pending = do
       (event, rest) <- case Seq.viewl pending of
         EmptyL -> do
@@ -101,46 +113,56 @@ runAPI _ args = bracket (hDuplicate stdout) hClose $ \protocol -> do
       case event of
         InputEnded -> pure ()
         InputFailed e -> throwIO e
-        AutoCompleted _ _ -> loop events protocol revision session rest
+        WorkerCompleted _ _ -> loop events protocol revision session rest
         RequestEvent (Right (Request "cancel" _ _ _)) ->
           loop events protocol revision session rest
-        RequestEvent (Right request@(AutoRequest _)) -> do
+        RequestEvent (Right request) | cancellable request -> do
           token <- newUnique
           completed <- bracket
             (forkIOWithUnmask $ \unmask -> do
-              outcome <- try $ unmask $ prepareRequest opts revision session request
-              writeChan events $ AutoCompleted token outcome)
+              outcome <- try $ unmask $ case request of
+                ApplyRequest _ _ (Just milliseconds) -> do
+                  result <- timeout (milliseconds * 1000) $
+                    prepareRequest opts revision session request
+                  maybe (apiFailure "TIMEOUT" "Proof step exceeded timeout_ms" True "observe") pure result
+                _ -> prepareRequest opts revision session request
+              writeChan events $ WorkerCompleted token outcome)
             killThread $ \worker ->
-              awaitAuto events worker token revision session rest
+              awaitWorker events worker token request revision session rest
           case completed of
             Nothing -> pure ()
             Just (outcome, queued) -> finish events protocol revision session queued outcome
         RequestEvent request -> do
-          outcome <- try $ either apiError (prepareRequest opts revision session) request
+          outcome <- try $ either
+            (\message -> apiFailure "INVALID_REQUEST" message True "help")
+            (prepareRequest opts revision session) request
           finish events protocol revision session rest outcome
     finish events protocol revision session pending outcome = case outcome of
       Left (e :: SomeException) -> case fromException e :: Maybe AsyncException of
-        Just a -> throwIO a
-        Nothing -> do
-          writeResponse protocol $ encode $ object
-            ["status" .= ("error" :: String), "message" .= displayException e,
-             "revision" .= revision]
+        Just a | a /= HeapOverflow && a /= StackOverflow -> throwIO a
+        _ -> do
+          writeResponse protocol $ encode $ errorResponse revision e
           loop events protocol revision session pending
       Right (next, nextRevision, bytes, stop) -> do
         writeResponse protocol bytes
         unless stop $ loop events protocol nextRevision next pending
 
 -- Cancel has no reply of its own, including when idle. Other pipelined
--- requests wait for the auto reply; EOF shuts down without committing it.
-awaitAuto :: Chan APIEvent -> ThreadId -> Unique -> Integer -> Maybe Session
-          -> Seq APIEvent
-          -> IO (Maybe (Either SomeException PreparedResponse, Seq APIEvent))
-awaitAuto events worker token revision session pending = do
+-- requests wait for the worker reply; EOF shuts down without committing it.
+cancellable :: Request -> Bool
+cancellable (AutoRequest _) = True
+cancellable (ApplyRequest _ _ _) = True
+cancellable _ = False
+
+awaitWorker :: Chan APIEvent -> ThreadId -> Unique -> Request -> Integer -> Maybe Session
+            -> Seq APIEvent
+            -> IO (Maybe (Either SomeException PreparedResponse, Seq APIEvent))
+awaitWorker events worker token request revision session pending = do
   event <- readChan events
   case event of
     InputEnded -> pure Nothing
     InputFailed e -> throwIO e
-    AutoCompleted completed outcome
+    WorkerCompleted completed outcome
       | completed == token -> pure $ Just (outcome, pending)
       | otherwise -> await
     RequestEvent (Right (Request "cancel" _ _ _)) -> do
@@ -152,21 +174,24 @@ awaitAuto events worker token revision session pending = do
         Nothing -> pure Nothing
         Just queued -> do
           outcome <- try $ do
-            original <- require "No theory loaded; use load first" session
-            fields <- stateFields original
-            prepareResponse revision session
-              (fields ++ ["auto_steps" .= (0 :: Integer), "auto_reason" .= ("cancelled" :: String)])
-              False
+            case request of
+              AutoRequest _ -> do
+                original <- require "No theory loaded; use load first" session
+                fields <- stateFields Compact original
+                prepareResponse revision session
+                  (fields ++ ["auto_steps" .= (0 :: Integer), "auto_reason" .= ("cancelled" :: String)])
+                  False
+              _ -> apiFailure "CANCELLED" "Proof step cancelled; proof unchanged" True "observe"
           pure $ Just (outcome, queued)
-    RequestEvent _ -> awaitAuto events worker token revision session (pending |> event)
+    RequestEvent _ -> awaitWorker events worker token request revision session (pending |> event)
   where
-    await = awaitAuto events worker token revision session pending
+    await = awaitWorker events worker token request revision session pending
     waitCancelled queued = do
       event <- readChan events
       case event of
         InputEnded -> pure Nothing
         InputFailed e -> throwIO e
-        AutoCompleted completed _
+        WorkerCompleted completed _
           | completed == token -> pure $ Just queued
           | otherwise -> waitCancelled queued
         RequestEvent (Right (Request "cancel" _ _ _)) -> waitCancelled queued
@@ -195,7 +220,7 @@ prepareRequest :: Loader.TheoryLoadOptions -> Integer -> Maybe Session -> Reques
 prepareRequest _ revision previous (AutoRequest steps) = do
   session <- require "No theory loaded; use load first" previous
   (next, count, reason) <- automatic steps session
-  fields <- stateFields next
+  fields <- stateFields Compact next
   let nextRevision = if count > 0 then revision + 1 else revision
   prepareResponse nextRevision (Just next)
     (fields ++ ["auto_steps" .= count, "auto_reason" .= reason]) False
@@ -224,27 +249,68 @@ parseRequest = withObject "request" $ \o -> do
     "load" -> Request command . Just <$> o .: "file" <*> pure Nothing <*> pure Nothing
     "save" -> Request command . Just <$> o .: "file" <*> pure Nothing <*> pure Nothing
     "lemma" -> Request command . Just <$> o .: "name" <*> pure Nothing <*> pure Nothing
-    "apply" -> Request command Nothing . Just <$> o .: "method_id"
-      <*> (Just <$> o .: "expected_revision")
-    "step" -> Request "apply" Nothing . Just <$> o .: "method_id"
-      <*> (Just <$> o .: "expected_revision")
+    "apply" -> parseApply o
+    "step" -> parseApply o
+    "goto" -> GotoRequest <$> o .: "node_id" <*> o .: "expected_revision"
+    "observe" -> ObserveRequest <$> parseDetail o
+    "state" -> ObserveRequest <$> parseDetail o
     "branch" -> Request command Nothing . Just <$> o .: "branch_id" <*> pure Nothing
     "auto" -> do
       steps <- o .:! "steps"
       when (maybe False (< 0) steps) $ fail "steps must be a nonnegative integer"
       pure $ AutoRequest steps
     _ -> pure $ Request command Nothing Nothing Nothing
+  where
+    parseApply o = do
+      method <- o .: "method_id"
+      revision <- o .: "expected_revision"
+      milliseconds <- o .:! "timeout_ms"
+      when (maybe False (\n -> n <= 0 || n > maxBound `div` 1000) milliseconds) $
+        fail "timeout_ms must be a positive integer representable in microseconds"
+      pure $ ApplyRequest method revision milliseconds
+    parseDetail o = do
+      detail <- o .:? "detail" .!= ("compact" :: String)
+      case detail of
+        "compact" -> pure Compact
+        "goals" -> pure Goals
+        "full" -> pure Full
+        _ -> fail "detail must be compact, goals, or full"
 
 changesRevision :: Request -> Bool
 changesRevision (Request command _ _ _) = command `elem`
   ["load", "lemma", "branch", "back", "apply", "reset", "undo", "redo", "check"]
 changesRevision (AutoRequest _) = False
+changesRevision (ApplyRequest _ _ _) = True
+changesRevision (GotoRequest _ _) = True
+changesRevision (ObserveRequest _) = False
+
+apiFailure :: String -> String -> Bool -> String -> IO a
+apiFailure code message recoverable action =
+  throwIO $ APIError code message recoverable action
 
 apiError :: String -> IO a
-apiError = ioError . userError
+apiError message = apiFailure "INVALID_STATE" message True "observe"
+
+errorResponse :: Integer -> SomeException -> Value
+errorResponse revision exception =
+  let APIError code message recoverable action =
+        case fromException exception of
+          Just failure -> failure
+          Nothing -> case fromException exception :: Maybe AsyncException of
+            Just HeapOverflow -> APIError "RESOURCE_LIMIT" "Backend heap limit exceeded" False "restart"
+            Just StackOverflow -> APIError "RESOURCE_LIMIT" "Backend stack limit exceeded" False "restart"
+            _ -> case fromException exception :: Maybe IOException of
+              Just _ -> APIError "IO_ERROR" (displayException exception) True "retry"
+              Nothing -> APIError "ENGINE_ERROR" (displayException exception) True "observe"
+  in object ["status" .= ("error" :: String), "revision" .= revision,
+       "error" .= object ["code" .= code, "message" .= message,
+         "recoverable" .= recoverable, "suggested_action" .= action]]
 
 require :: String -> Maybe a -> IO a
 require message = maybe (apiError message) pure
+
+requireCode :: String -> String -> String -> Maybe a -> IO a
+requireCode code message action = maybe (apiFailure code message True action) pure
 
 success :: Integer -> [Pair] -> Value
 success revision fields = object $
@@ -254,9 +320,25 @@ success revision fields = object $
 dispatch :: Loader.TheoryLoadOptions -> Integer -> Maybe Session -> Request
          -> IO (Maybe Session, [Pair], Bool)
 dispatch _ _ _ (AutoRequest _) = apiError "Auto must run in its cancellable worker"
+dispatch _ _ previous (ObserveRequest detail) = do
+  session <- require "No theory loaded; use load first" previous
+  fields <- stateFields detail session
+  pure (previous, fields, False)
+dispatch _ revision previous (GotoRequest ident expected) = do
+  when (expected /= revision) $
+    apiFailure "STALE_REVISION" "Proof tree revision changed; refresh node references" True "frontier"
+  session <- require "No theory loaded; use load first" previous
+  (name, proof, _, _) <- selection session
+  path <- requireCode "INVALID_NODE" "No such proof node in the selected lemma" "frontier" $
+    pathForNodeId proof ident
+  next <- refresh session { cursors = M.insert name path (cursors session) }
+  fields <- stateFields Compact next
+  pure (Just next, fields, False)
+dispatch opts revision previous (ApplyRequest method expected _) =
+  dispatch opts revision previous (Request "apply" Nothing (Just method) (Just expected))
 dispatch opts revision previous (Request command text index expectedRevision)
   | command == "apply" && expectedRevision /= Just revision =
-      apiError "Stale expected_revision; refresh state or methods before applying a method"
+      apiFailure "STALE_REVISION" "Stale expected_revision; refresh state or methods before applying a method" True "observe"
   | command == "quit" = pure (previous, [], True)
   | command == "load" = do
       file <- require "Missing file" text
@@ -265,13 +347,13 @@ dispatch opts revision previous (Request command text index expectedRevision)
       loaded <- runExceptT $ Loader.loadTheory opts contents file
       original <- case loaded of
         Left e -> apiError (show e)
-        Right (Right _) -> apiError "Diff/equivalence theories are not supported by proof-api; use the GUI."
+        Right (Right _) -> apiFailure "UNSUPPORTED_THEORY" "Diff/equivalence theories are not supported by proof-api; use the GUI." True "load"
         Right (Left thy) -> evaluate (force thy)
       sig <- toSignatureWithMaude opts.maudePath (L.get thySignature original)
       closed <- runExceptT $ Loader.closeTheory "" opts sig (Left original)
       thy <- case closed of
         Left e -> apiError (show e)
-        Right (_, Right _) -> apiError "Diff/equivalence theories are not supported by proof-api."
+        Right (_, Right _) -> apiFailure "UNSUPPORTED_THEORY" "Diff/equivalence theories are not supported by proof-api." True "load"
         Right (warnings, Left t) -> do
           unless (null warnings) $
             hPutStrLn stderr $ "WARNING: theory wellformedness checks failed:\n"
@@ -296,20 +378,23 @@ dispatch opts revision previous (Request command text index expectedRevision)
           _ <- evaluate (force contents)
           atomicSave file contents
           unchanged session ["file" .= file]
-        "state" -> selected session []
         "methods" -> do
-          _ <- selection session
-          unchanged session ["methods" .= methodValues session]
+          (_, _, _, node) <- selection session
+          unchanged session ["methods" .= methodValues session node]
         "goals" -> do
           (_, _, _, node) <- selection session
           unchanged session ["goals" .= goalValues node]
         "branches" -> do
           (_, proof, path, node) <- selection session
           unchanged session ["branches" .= branchValues proof path node]
+        "frontier" -> do
+          (name, proof, _, _) <- selection session
+          unchanged session ["lemma" .= name, "frontier" .= frontierValues "0" proof]
         "branch" -> do
           (name, _, path, node) <- selection session
           i <- require "Missing branch_id" index
-          (caseName, _) <- require "Invalid branch index" $ atIndex i (M.toList (children node))
+          (caseName, _) <- requireCode "INVALID_NODE" "Invalid branch index" "branches" $
+            atIndex i (M.toList (children node))
           next <- refresh session { cursors = M.insert name (path ++ [caseName]) (cursors session) }
           selected next []
         "back" -> do
@@ -322,7 +407,8 @@ dispatch opts revision previous (Request command text index expectedRevision)
           unless (isSorry node && M.null (children node)) $
             apiError "This node already contains a proof step or retained subproof; use reset before replacing it"
           i <- require "Missing method_id" index
-          method <- require "Invalid method index" $ atIndex i (cachedMethods session)
+          method <- requireCode "INVALID_METHOD" "Invalid method index" "methods" $
+            atIndex i (cachedMethods session)
           sys <- require "No annotated proof state at this node" $ psInfo (root node)
           lemma <- require "No such lemma" $ lookupLemma name (currentTheory session)
           let ctxt = getProofContext lemma (currentTheory session)
@@ -374,11 +460,11 @@ dispatch opts revision previous (Request command text index expectedRevision)
           let (result, message) = checkedResult replayed lemma
           pure (Just next,
             ["lemma" .= name, "result" .= result, "message" .= message], False)
-        _ -> apiError $ "Unknown command: " ++ command
+        _ -> apiFailure "INVALID_REQUEST" ("Unknown command: " ++ command) True "help"
   where
     unchanged session response = pure (Just session, response, False)
     selected session extra = do
-      fields <- stateFields session
+      fields <- stateFields Compact session
       unchanged session (fields ++ extra)
 
 atIndex :: Int -> [a] -> Maybe a
@@ -509,6 +595,32 @@ rememberMutation before after =
   in change `seq` after
     { undoHistory = change : undoHistory before, redoHistory = [] }
 
+-- Numeric IDs are revision-local addresses, not the engine's case-name paths.
+-- Require canonical decimal components so malformed IDs never alias a node.
+pathForNodeId :: IncrementalProof -> String -> Maybe ProofPath
+pathForNodeId proof ident = case components ident of
+  "0" : rest -> descend proof rest
+  _ -> Nothing
+  where
+    components value = case break (== '.') value of
+      (part, []) -> [part]
+      (part, _ : rest) -> part : components rest
+    descend _ [] = Just []
+    descend node (part : rest) = do
+      i <- readMaybe part
+      if show (i :: Int) /= part then Nothing else do
+        (name, child) <- atIndex i (M.toList (children node))
+        (name :) <$> descend child rest
+
+frontierValues :: String -> IncrementalProof -> [Value]
+frontierValues ident node
+  | M.null (children node) =
+      [object ["node_id" .= ident, "branch_status" .= branchStatus node,
+               "goal_count" .= goalCount node] | isSorry node]
+  | otherwise = concat
+      [frontierValues (ident ++ "." ++ show i) child
+      | (i, child) <- zip [0 :: Int ..] (M.elems (children node))]
+
 nodeId :: IncrementalProof -> ProofPath -> String
 nodeId proof = go "0" proof
   where
@@ -541,16 +653,45 @@ branchStatus proof
       , proofStepStatus step
       )
 
-methodValues :: Session -> [Value]
-methodValues session =
-  [object ["id" .= i, "text" .= render (prettyProofMethod method)]
-  | (i, method) <- zip [0 :: Int ..] (cachedMethods session)]
+methodValues :: Session -> IncrementalProof -> [Value]
+methodValues session node =
+  [object $ ["id" .= i, "text" .= render (prettyProofMethod method),
+             "name" .= name, "kind" .= kind] ++ relatedGoal method
+  | (i, method) <- zip [0 :: Int ..] (cachedMethods session)
+  , let (name, kind) = methodMetadata method]
+  where
+    goalIds = M.fromList $ zip (nodeGoals node) [0 :: Int ..]
+    relatedGoal (SolveGoal goal) =
+      maybe [] (\i -> ["goal_id" .= ("g" ++ show i)]) $ M.lookup goal goalIds
+    relatedGoal _ = []
+
+methodMetadata :: ProofMethod -> (String, String)
+methodMetadata Simplify = ("simplify", "simplification")
+methodMetadata (SolveGoal _) = ("solve", "constraint_resolution")
+methodMetadata Induction = ("induction", "induction")
+methodMetadata (Finished _) = ("finished", "termination")
+methodMetadata (Sorry _) = ("sorry", "admission")
+methodMetadata Invalidated = ("invalidated", "invalidation")
+
+nodeGoals :: IncrementalProof -> [Goal]
+nodeGoals node = maybe [] (map fst . openGoals) (psInfo (root node))
+
+goalCount :: IncrementalProof -> Int
+goalCount = length . nodeGoals
 
 goalValues :: IncrementalProof -> [Value]
-goalValues node = case psInfo (root node) of
-  Nothing -> []
-  Just sys -> [object ["id" .= i, "text" .= render (prettyGoal goal)]
-              | (i, (goal, _)) <- zip [0 :: Int ..] (openGoals sys)]
+goalValues node =
+  [object ["id" .= i, "goal_id" .= ("g" ++ show i), "text" .= render (prettyGoal goal)]
+  | (i, goal) <- zip [0 :: Int ..] (nodeGoals node)]
+
+constraintValue :: System -> Value
+constraintValue sys = object
+  [ "formulas" .= map (render . prettyGuarded) (S.toList $ L.get sFormulas sys)
+  , "equations" .= render (prettyEqStore $ L.get sEqStore sys)
+  , "subterms" .= render (prettySubtermStore $ L.get sSubtermStore sys)
+  , "ordering" .= map (render . prettyLess) (S.toList $ L.get sLessAtoms sys)
+  , "last" .= fmap (render . prettyNodeId) (L.get sLastAtom sys)
+  ]
 
 branchValues :: IncrementalProof -> ProofPath -> IncrementalProof -> [Value]
 branchValues proof path node =
@@ -558,15 +699,23 @@ branchValues proof path node =
            "status" .= branchStatus child]
   | (i, (name, child)) <- zip [0 :: Int ..] (M.toList (children node))]
 
-stateFields :: Session -> IO [Pair]
-stateFields session = do
+stateFields :: Detail -> Session -> IO [Pair]
+stateFields detail session = do
   (name, proof, path, node) <- selection session
-  pure ["lemma" .= name, "node_id" .= nodeId proof path,
-        "branch_status" .= branchStatus node,
-        "state" .= maybe "No annotated constraint system (invalid or unreachable proof step)."
-                     (render . prettySystem) (psInfo (root node)),
-        "goals" .= goalValues node, "methods" .= methodValues session,
-        "branches" .= branchValues proof path node]
+  let compact =
+        ["lemma" .= name, "node_id" .= nodeId proof path,
+         "branch_status" .= branchStatus node, "goal_count" .= goalCount node,
+         "children_count" .= M.size (children node),
+         "methods" .= methodValues session node, "branches" .= branchValues proof path node]
+      goals = ["goals" .= goalValues node,
+               "constraints" .= fmap constraintValue (psInfo (root node))]
+      full = ["state" .= maybe "No annotated constraint system (invalid or unreachable proof step)."
+                              (render . prettySystem) (psInfo (root node))]
+  -- No prettySystem evaluation or full-state serialization on compact/goals paths.
+  pure $ compact ++ case detail of
+    Compact -> []
+    Goals -> goals
+    Full -> goals ++ full
 
 treeValue :: String -> String -> IncrementalProof -> Value
 treeValue ident name node = object
