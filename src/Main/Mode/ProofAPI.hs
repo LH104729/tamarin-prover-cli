@@ -1,9 +1,10 @@
 {-# LANGUAGE FieldSelectors #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
--- | JSON-lines interface to manual, native Tamarin proof construction.
+-- | JSON-lines interface to native proof construction and cancellable search.
 module Main.Mode.ProofAPI (proofAPIMode) where
 
+import Control.Concurrent (Chan, ThreadId, forkIOWithUnmask, killThread, newChan, readChan, writeChan)
 import Control.DeepSeq (force)
 import Control.Exception hiding (handle)
 import Control.Monad (unless, when)
@@ -17,6 +18,9 @@ import Data.List (foldl', intercalate, isPrefixOf)
 import Data.Map.Strict qualified as M
 import Data.Monoid (Any (..))
 import Data.Maybe (fromMaybe, isNothing)
+import Data.Sequence (Seq, ViewL (..), (|>))
+import Data.Sequence qualified as Seq
+import Data.Unique (Unique, newUnique)
 import GHC.IO.Handle (hDuplicate, hDuplicateTo)
 import Main.Console
 import Main.TheoryLoader qualified as Loader
@@ -24,6 +28,7 @@ import System.Console.CmdArgs.Explicit
 import System.Directory (removeFile, renameFile)
 import System.FilePath (takeDirectory, takeFileName)
 import System.IO
+import System.IO.Error (isEOFError)
 import Text.PrettyPrint.Class (render)
 import Theory
 import Theory.Constraint.Solver.Goals (openGoals)
@@ -50,10 +55,19 @@ data Snapshot = Snapshot
 data Mutation = Mutation !Snapshot !Snapshot
 
 data Request = Request String (Maybe String) (Maybe Int) (Maybe Integer)
+  | AutoRequest (Maybe Integer)
+
+type PreparedResponse = (Maybe Session, Integer, BL.ByteString, Bool)
+
+data APIEvent
+  = RequestEvent (Either String Request)
+  | InputEnded
+  | InputFailed SomeException
+  | AutoCompleted Unique (Either SomeException PreparedResponse)
 
 proofAPIMode :: TamarinMode
 proofAPIMode = tamarinMode "proof-api"
-  "Serve manual proof operations as JSON lines on standard input/output."
+  "Serve native proof operations and cancellable search as JSON lines."
   setup runAPI
   where
     setup m = m
@@ -70,45 +84,138 @@ runAPI _ args = bracket (hDuplicate stdout) hClose $ \protocol -> do
   hSetBuffering protocol LineBuffering
   hDuplicateTo stderr stdout
   hSetBuffering stdout LineBuffering
-  loop protocol 0 Nothing
+  events <- newChan
+  bracket (forkIOWithUnmask $ \unmask -> unmask $ readRequests events)
+    killThread $ \_ -> loop events protocol 0 Nothing Seq.empty
   where
     opts = Loader.defaultTheoryLoadOptions
       { Loader.maudePath = maudePath args }
-    -- Revisions belong to the protocol session, not restorable proof history.
-    loop protocol revision session = do
-      eof <- hIsEOF stdin
-      unless eof $ do
-        line <- BS.hGetLine stdin
-        outcome <- try $ do
-          request <- either apiError pure $ eitherDecodeStrict' line >>= parseEither parseRequest
-          (next, response, stop) <- dispatch opts revision session request
-          let nextRevision = if changesRevision request then revision + 1 else revision
-          -- Force both the new engine state and the complete response before
-          -- committing: a lazy Maude/pretty-printer exception is an error reply,
-          -- not a half JSON line or a corrupted session.
-          case next of
+    -- Only this loop commits sessions and writes protocol responses. The input
+    -- reader stays live while auto evaluates a private, cancellable candidate.
+    loop events protocol revision session pending = do
+      (event, rest) <- case Seq.viewl pending of
+        EmptyL -> do
+          event <- readChan events
+          pure (event, pending)
+        event :< rest -> pure (event, rest)
+      case event of
+        InputEnded -> pure ()
+        InputFailed e -> throwIO e
+        AutoCompleted _ _ -> loop events protocol revision session rest
+        RequestEvent (Right (Request "cancel" _ _ _)) ->
+          loop events protocol revision session rest
+        RequestEvent (Right request@(AutoRequest _)) -> do
+          token <- newUnique
+          completed <- bracket
+            (forkIOWithUnmask $ \unmask -> do
+              outcome <- try $ unmask $ prepareRequest opts revision session request
+              writeChan events $ AutoCompleted token outcome)
+            killThread $ \worker ->
+              awaitAuto events worker token revision session rest
+          case completed of
             Nothing -> pure ()
-            Just s -> do
-              _ <- evaluate (force (currentTheory s))
-              _ <- evaluate (force (cachedMethods s))
-              pure ()
-          bytes <- evaluate (force (encode (success nextRevision response)))
-          pure (next, nextRevision, bytes, stop)
-        case outcome of
-          Left (e :: SomeException) -> case fromException e :: Maybe AsyncException of
-            Just a -> throwIO a
-            Nothing -> do
-              BL.hPutStr protocol $ encode $ object
-                ["status" .= ("error" :: String), "message" .= displayException e,
-                 "revision" .= revision]
-              BS.hPutStr protocol "\n"
-              hFlush protocol
-              loop protocol revision session
-          Right (next, nextRevision, bytes, stop) -> do
-            BL.hPutStr protocol bytes
-            BS.hPutStr protocol "\n"
-            hFlush protocol
-            unless stop $ loop protocol nextRevision next
+            Just (outcome, queued) -> finish events protocol revision session queued outcome
+        RequestEvent request -> do
+          outcome <- try $ either apiError (prepareRequest opts revision session) request
+          finish events protocol revision session rest outcome
+    finish events protocol revision session pending outcome = case outcome of
+      Left (e :: SomeException) -> case fromException e :: Maybe AsyncException of
+        Just a -> throwIO a
+        Nothing -> do
+          writeResponse protocol $ encode $ object
+            ["status" .= ("error" :: String), "message" .= displayException e,
+             "revision" .= revision]
+          loop events protocol revision session pending
+      Right (next, nextRevision, bytes, stop) -> do
+        writeResponse protocol bytes
+        unless stop $ loop events protocol nextRevision next pending
+
+-- Cancel has no reply of its own, including when idle. Other pipelined
+-- requests wait for the auto reply; EOF shuts down without committing it.
+awaitAuto :: Chan APIEvent -> ThreadId -> Unique -> Integer -> Maybe Session
+          -> Seq APIEvent
+          -> IO (Maybe (Either SomeException PreparedResponse, Seq APIEvent))
+awaitAuto events worker token revision session pending = do
+  event <- readChan events
+  case event of
+    InputEnded -> pure Nothing
+    InputFailed e -> throwIO e
+    AutoCompleted completed outcome
+      | completed == token -> pure $ Just (outcome, pending)
+      | otherwise -> await
+    RequestEvent (Right (Request "cancel" _ _ _)) -> do
+      killThread worker
+      -- throwTo waits for delivery, not worker termination. Wait for cleanup
+      -- (including external solver/oracle processes) before reusing the session.
+      settled <- waitCancelled pending
+      case settled of
+        Nothing -> pure Nothing
+        Just queued -> do
+          outcome <- try $ do
+            original <- require "No theory loaded; use load first" session
+            fields <- stateFields original
+            prepareResponse revision session
+              (fields ++ ["auto_steps" .= (0 :: Integer), "auto_reason" .= ("cancelled" :: String)])
+              False
+          pure $ Just (outcome, queued)
+    RequestEvent _ -> awaitAuto events worker token revision session (pending |> event)
+  where
+    await = awaitAuto events worker token revision session pending
+    waitCancelled queued = do
+      event <- readChan events
+      case event of
+        InputEnded -> pure Nothing
+        InputFailed e -> throwIO e
+        AutoCompleted completed _
+          | completed == token -> pure $ Just queued
+          | otherwise -> waitCancelled queued
+        RequestEvent (Right (Request "cancel" _ _ _)) -> waitCancelled queued
+        RequestEvent _ -> waitCancelled (queued |> event)
+
+readRequests :: Chan APIEvent -> IO ()
+readRequests events = do
+  line <- try $ BS.hGetLine stdin
+  case line of
+    Left (e :: IOException)
+      | isEOFError e -> writeChan events InputEnded
+      | otherwise -> writeChan events $ InputFailed (toException e)
+    Right bytes -> do
+      writeChan events $ RequestEvent $
+        eitherDecodeStrict' bytes >>= parseEither parseRequest
+      readRequests events
+
+writeResponse :: Handle -> BL.ByteString -> IO ()
+writeResponse protocol bytes = do
+  BL.hPutStr protocol bytes
+  BS.hPutStr protocol "\n"
+  hFlush protocol
+
+prepareRequest :: Loader.TheoryLoadOptions -> Integer -> Maybe Session -> Request
+               -> IO PreparedResponse
+prepareRequest _ revision previous (AutoRequest steps) = do
+  session <- require "No theory loaded; use load first" previous
+  (next, count, reason) <- automatic steps session
+  fields <- stateFields next
+  let nextRevision = if count > 0 then revision + 1 else revision
+  prepareResponse nextRevision (Just next)
+    (fields ++ ["auto_steps" .= count, "auto_reason" .= reason]) False
+prepareRequest opts revision previous request = do
+  (next, response, stop) <- dispatch opts revision previous request
+  let nextRevision = if changesRevision request then revision + 1 else revision
+  prepareResponse nextRevision next response stop
+
+-- Force the complete candidate and reply before the main loop can commit
+-- either. Lazy solver/pretty-printer failures leave the old session intact.
+prepareResponse :: Integer -> Maybe Session -> [Pair] -> Bool -> IO PreparedResponse
+prepareResponse revision next fields stop = do
+  case next of
+    Nothing -> pure ()
+    Just session -> do
+      _ <- evaluate (force (currentTheory session))
+      _ <- evaluate (force (cachedMethods session))
+      pure ()
+  bytes <- evaluate (force (encode (success revision fields)))
+  pure (next, revision, bytes, stop)
 
 parseRequest :: Value -> Parser Request
 parseRequest = withObject "request" $ \o -> do
@@ -122,11 +229,16 @@ parseRequest = withObject "request" $ \o -> do
     "step" -> Request "apply" Nothing . Just <$> o .: "method_id"
       <*> (Just <$> o .: "expected_revision")
     "branch" -> Request command Nothing . Just <$> o .: "branch_id" <*> pure Nothing
+    "auto" -> do
+      steps <- o .:! "steps"
+      when (maybe False (< 0) steps) $ fail "steps must be a nonnegative integer"
+      pure $ AutoRequest steps
     _ -> pure $ Request command Nothing Nothing Nothing
 
 changesRevision :: Request -> Bool
 changesRevision (Request command _ _ _) = command `elem`
   ["load", "lemma", "branch", "back", "apply", "reset", "undo", "redo", "check"]
+changesRevision (AutoRequest _) = False
 
 apiError :: String -> IO a
 apiError = ioError . userError
@@ -141,6 +253,7 @@ success revision fields = object $
 -- A failed operation never installs its candidate Session in the loop.
 dispatch :: Loader.TheoryLoadOptions -> Integer -> Maybe Session -> Request
          -> IO (Maybe Session, [Pair], Bool)
+dispatch _ _ _ (AutoRequest _) = apiError "Auto must run in its cancellable worker"
 dispatch opts revision previous (Request command text index expectedRevision)
   | command == "apply" && expectedRevision /= Just revision =
       apiError "Stale expected_revision; refresh state or methods before applying a method"
@@ -315,6 +428,65 @@ installProof session name proof = do
   -- Rebuild all proof annotations in declaration order, including subsequent
   -- reuse/source contexts. Native checking retains invalidated old subtrees.
   refresh session { currentTheory = replay thy }
+
+-- A budget counts method applications across the entire selected subtree,
+-- not proof depth. Recorded steps are traversed, never replaced. The private
+-- candidate has no intermediate history entries and is committed only after
+-- prepareResponse has forced both its theory and complete reply.
+automatic :: Maybe Integer -> Session -> IO (Session, Integer, String)
+automatic bound original = do
+  (name, _, start, _) <- selection original
+  if bound == Just 0
+    then pure (original, 0, "step_limit")
+    else do
+      (candidate, count, reason) <- walk name original 0 [start]
+      if count == 0
+        then pure (original, count, reason)
+        else do
+          -- Keep the operation's subtree selected so another bounded auto
+          -- resumes all of its remaining branches, not just the last leaf.
+          anchored <- selectPath name start candidate
+          pure (rememberMutation original anchored, count, reason)
+  where
+    walk name session count pending
+      | maybe False (count >=) bound = pure (session, count, "step_limit")
+      | otherwise = case pending of
+          [] -> pure (session, count, "finished")
+          path : rest -> do
+            (_, proof, _, _) <- selection session
+            case atPath proof path of
+              Nothing -> walk name session count rest
+              Just node
+                | not (M.null (children node)) ->
+                    walk name session count (childPaths path node ++ rest)
+                | isSorry node, Just sys <- psInfo (root node) -> do
+                    focused <- selectPath name path session
+                    case cachedMethods focused of
+                      -- Oracle stopping methods are sorry leaves too. Once
+                      -- recorded, revisiting them must not consume another
+                      -- step or make unbounded auto loop without progress.
+                      [] -> walk name focused count rest
+                      method : _
+                        | method == psMethod (root node) ->
+                            walk name focused count rest
+                        | otherwise -> do
+                            lemma <- require "No such lemma" $
+                              lookupLemma name (currentTheory focused)
+                            let ctxt = getProofContext lemma (currentTheory focused)
+                            proof' <- require "The selected proof method failed" $
+                              modifyAtPath
+                                (runProver (oneStepProver method) ctxt (length path) sys)
+                                path proof
+                            installed <- installProof focused name proof'
+                            (_, _, _, applied) <- selection installed
+                            let count' = count + 1
+                            count' `seq` walk name installed count'
+                              (childPaths path applied ++ rest)
+                | otherwise -> walk name session count rest
+    selectPath name path session
+      | M.lookup name (cursors session) == Just path = pure session
+      | otherwise = refresh session { cursors = M.insert name path (cursors session) }
+    childPaths path node = [path ++ [name] | name <- M.keys (children node)]
 
 isSorry :: IncrementalProof -> Bool
 isSorry node = case psMethod (root node) of

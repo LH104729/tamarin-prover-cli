@@ -21,6 +21,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import signal
 import shutil
 import subprocess
 from typing import Any, Dict, Optional, Sequence, TextIO, Union
@@ -158,6 +159,9 @@ class TamarinClient:
                     text=True,
                     encoding="utf-8",
                     bufsize=1,
+                    # Terminal Ctrl-C belongs to the frontend. Auto forwards it
+                    # as protocol cancellation, not a process-killing signal.
+                    start_new_session=True,
                 )
             except OSError as exc:
                 raise BackendUnavailableError(f"Cannot start backend {command[0]!r}: {exc}") from exc
@@ -170,14 +174,17 @@ class TamarinClient:
         A protocol failure closes the client instead of silently losing or
         replacing the backend's proof session.
         """
+        return self._request(command, parameters)
+
+    def _request(
+        self, command: str, parameters: Dict[str, Any], *, interruptible: bool = False
+    ) -> Dict[str, Any]:
         payload = json.dumps({"command": command, **parameters}, ensure_ascii=False)
         self.start()
         process = self._process
         assert process is not None and process.stdin is not None and process.stdout is not None
         try:
-            process.stdin.write(payload + "\n")
-            process.stdin.flush()
-            line = process.stdout.readline()
+            line = self._exchange(process, payload, interruptible=interruptible)
         except (OSError, UnicodeError) as exc:
             self._shutdown(send_quit=False)
             raise ProtocolError(f"Backend communication failed: {exc}") from exc
@@ -202,6 +209,42 @@ class TamarinClient:
         if response["status"] == "error":
             raise BackendError(response)
         return response
+
+    @staticmethod
+    def _exchange(
+        process: subprocess.Popen[str], payload: str, *, interruptible: bool
+    ) -> str:
+        assert process.stdin is not None and process.stdout is not None
+        sent = False
+        cancel_requested = False
+        cancel_sent = False
+
+        def send_cancel() -> None:
+            nonlocal cancel_sent
+            if not cancel_sent:
+                cancel_sent = True
+                process.stdin.write('{"command":"cancel"}\n')
+                process.stdin.flush()
+
+        def interrupt(signum: int, frame: Any) -> None:
+            nonlocal cancel_requested
+            cancel_requested = True
+            if sent:
+                send_cancel()
+
+        previous = signal.signal(signal.SIGINT, interrupt) if interruptible else None
+        try:
+            process.stdin.write(payload + "\n")
+            process.stdin.flush()
+            sent = True
+            if cancel_requested:
+                send_cancel()
+            # Drain the original response even after cancellation, keeping the
+            # JSON-lines stream aligned for the next interactive command.
+            return process.stdout.readline()
+        finally:
+            if interruptible:
+                signal.signal(signal.SIGINT, previous)
 
     def load(self, file: Union[str, os.PathLike[str]]) -> Dict[str, Any]:
         """Load a native .spthy theory, including existing proof steps."""
@@ -236,6 +279,18 @@ class TamarinClient:
         Stale or missing revisions are rejected without changing the proof.
         """
         return self.request("apply", method_id=method_id, expected_revision=revision)
+
+    def auto(self, steps: Optional[int] = None) -> Dict[str, Any]:
+        """Search the selected subtree; None means no method-application limit.
+
+        Ctrl-C cancels the entire operation and retains the pre-auto session,
+        like the GUI's Cancel action. A completed run is one undo entry.
+        Called on the main thread so SIGINT can be handled synchronously.
+        """
+        if steps is not None and (type(steps) is not int or steps < 0):
+            raise ValueError("steps must be a non-negative integer or None")
+        parameters = {} if steps is None else {"steps": steps}
+        return self._request("auto", parameters, interruptible=True)
 
     def branches(self) -> Dict[str, Any]:
         """List the selected node's immediate child branches."""

@@ -1,4 +1,4 @@
-"""Manual Tamarin proof exploration over the proof-api JSON-lines backend."""
+"""Tamarin proof exploration over the proof-api JSON-lines backend."""
 
 from .client import (
     BackendError,

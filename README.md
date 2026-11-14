@@ -15,8 +15,8 @@ Developing and contributing
 See [contributing instructions](CONTRIBUTING.md) for instructions on how to develop,
 test and release changes to the Tamarin prover source code.
 
-Manual proof exploration in the terminal
-----------------------------------------
+Proof exploration in the terminal
+---------------------------------
 
 Build and run from this checkout without installing Tamarin:
 
@@ -40,6 +40,7 @@ The REPL supports:
 | `load` (`ld`), `lemmas` (`ls`), `lemma` (`l`) | Load a native theory; list, select, or resume lemmas |
 | `state [full]` (`s [full]`), `goals` (`g`), `methods` (`m`) | Show a compact summary or full native state; list goals or methods |
 | `apply <id>` (`a <id>`) | Execute exactly one explicitly selected engine proof method |
+| `auto [k]` | Search the selected subtree with up to `k` method applications, or without a limit |
 | `branches` (`bs`), `branch <id>` (`b <id>`), `back` (`p`) | Inspect children, select one, or return to its parent |
 | `undo` (`u`), `redo` (`r`) | Reverse the last proof mutation or restore it |
 | `reset` | Replace the selected step and descendants with `sorry` |
@@ -61,26 +62,39 @@ method. For multiple children it stays at the parent; use `b <id>` to choose.
 Unnamed children are displayed as `(continuation)`. Switch siblings with `back`,
 then `branch <id>`. Lemma switches retain each lemma's tree and cursor.
 
-`undo` reverses the last successful `apply` or `reset`, even after navigating or
-switching lemmas. `redo` restores the exact resulting proof and selection without
-re-executing a method. Navigation, selection, checking, and saving do not create
-history entries. A new successful mutation clears redo; failed commands do not.
+`undo` reverses the last successful `apply`, `auto`, or `reset`, even after
+navigating or switching lemmas. A completed `auto` run is one undo entry.
+`redo` restores the exact resulting proof and selection without re-executing
+methods. Navigation, selection, checking, and saving do not create history
+entries. A new successful mutation clears redo; failed commands do not.
 `reset` explicitly discards only the selected subtree, never an ancestor.
 An already-empty `sorry` cannot be reset. Undo can restore a reset subtree.
 History is session-only and is cleared by a successful `load`, not persisted in
 `.spthy`. Empty lines never repeat proof commands.
 
+`auto 10` applies at most ten methods in total, not ten levels per branch.
+`auto` has no step limit; `auto 0` only displays the current state. Search uses
+Tamarin's ranked methods depth-first within the selected subtree, preserving
+existing steps and visiting unfinished children. The selected subtree root stays
+selected, so another `auto` resumes the same scope. Navigation and terminal cases
+recognized by the engine do not consume additional steps. Unbounded search
+may not terminate. Press **Ctrl-C during auto** to cancel it and return to the
+prompt: like the GUI's Cancel action, the entire running operation is discarded,
+preserving the pre-auto proof, selection, and undo/redo history.
+
 Loading another theory explicitly replaces the session; save first to retain
-edits. Quote paths containing spaces. `quit`, EOF, and Ctrl-C do not save
-automatically. Readline command history is available within the session.
+edits. Quote paths containing spaces. `quit`, EOF, and Ctrl-C outside `auto` do
+not save automatically; Ctrl-C outside `auto` exits. Readline command history
+is available within the session.
 
 Proof construction reuses Tamarin's native methods, including simplification,
 induction, and constraint solving. The engine may immediately recognize terminal
-cases, as in Explore mode, but the CLI does not automatically choose subsequent
-methods. `check` replays recorded proof steps without proof search and returns
-`verified`, `falsified`, `incomplete`, or `invalid`. A remaining `sorry` always
-makes the CLI's result incomplete, even if another branch already contains a
-witness; the original prover retains its own quantifier-specific reporting.
+cases, as in Explore mode. Subsequent methods run only when explicitly selected
+with `apply` or requested with `auto`. `check` replays recorded proof steps
+without proof search and returns `verified`, `falsified`, `incomplete`, or `invalid`.
+A remaining `sorry` always makes the CLI's result incomplete, even if another
+branch already contains a witness; the original prover retains its own
+quantifier-specific reporting.
 
 Saving preserves source theory declarations and native proof scripts, not
 original whitespace. Partial proofs retain explicit `sorry` branches. Saved
@@ -102,6 +116,7 @@ with TamarinClient() as client:
     print(listing["methods"])
     # After choosing a method ID, apply using this listing's revision:
     # client.apply(method_id, revision=listing["revision"])
+    # Or explicitly request search: client.auto(10), or client.auto() unbounded.
     client.save("partial.spthy")
 ```
 
@@ -109,6 +124,9 @@ Every client operation returns a response dictionary. Backend command errors
 raise `BackendError` without replacing the session. `request(command, **fields)`
 exposes the underlying protocol for scripting. The synchronous client owns one
 backend process; use a context manager or `close()` to release it.
+`client.auto(steps=None)` runs cancellable search on the main thread; a
+non-negative integer limits method applications. Its response includes
+`auto_steps` and `auto_reason` (`step_limit`, `finished`, or `cancelled`).
 
 Method application requires an explicit revision:
 `client.apply(method_id, revision=listing["revision"])`. Use the revision from
@@ -121,9 +139,10 @@ and reconsider the choice rather than automatically retrying an old index.
 
 Every response includes a monotonic integer `revision`. Successful load,
 lemma selection, branch navigation, apply, reset, undo, redo, and check advance
-it; errors and read-only inspection/save do not. Undo/redo never restore old
-revision numbers, and reload does not reset the counter. Tokens are local to
-one backend process and are not proof-storage data.
+it, as does an auto run that applies methods; cancelled or zero-step auto runs
+do not. Errors and read-only inspection/save do not advance it. Undo/redo never
+restore old revision numbers, and reload does not reset the counter. Tokens
+are local to one backend process and are not proof-storage data.
 
 The REPL supplies the revision belonging to the methods it displays.
 After `check`, refresh with `methods` or `state` before applying another step.
@@ -137,11 +156,14 @@ and must explicitly open a new client session to continue.
 
 The backend can be used directly with
 `stack exec --no-install-ghc -- tamarin-prover proof-api`. It accepts one JSON
-object per input line and emits one response per line; engine diagnostics go
+object per input line and emits one response per ordinary request; engine diagnostics go
 to stderr. Requests use `command` and, where needed, `file`, `name`,
-`method_id`, or `branch_id`. Command names match the REPL. Responses have
-`status: "success"` or `status: "error"` with a `message`; current-node status
-is `branch_status`. Trees and branches expose numeric-path `node_id` values.
+`method_id`, `branch_id`, or `steps`. Command names match the REPL. While `auto`
+is running, send `{"command":"cancel"}` to cancel it. This out-of-band message
+never has its own reply (including when idle); the original `auto` response
+reports cancellation. Responses have `status: "success"` or `status: "error"`
+with a `message`; current-node status is `branch_status`. Trees and branches
+expose numeric-path `node_id` values.
 On `apply`, `applied_at` identifies the node where the method ran and
 `generated_branches` lists its resulting children. The ordinary state fields
 describe the resulting cursor, including automatic single-child navigation.

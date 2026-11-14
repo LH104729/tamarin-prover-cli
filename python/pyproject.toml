@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tamarin-cli"
 version = "0.1.0"
-description = "Manual Explore-mode terminal and Python client for Tamarin Prover"
+description = "Explore-mode terminal and Python client for Tamarin Prover"
 requires-python = ">=3.9"
 license = {text = "GPL-3.0-or-later"}
 dependencies = []

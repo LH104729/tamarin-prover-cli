@@ -1,4 +1,4 @@
-"""Human-readable, manually controlled Explore-mode terminal interface."""
+"""Human-readable Explore-mode terminal interface with opt-in proof search."""
 
 from __future__ import annotations
 
@@ -19,9 +19,9 @@ from .client import (
 
 
 class TamarinShell(cmd.Cmd):
-    """Present backend responses without choosing or applying proof methods."""
+    """Explore native proofs manually or with explicitly requested automation."""
 
-    intro = "Tamarin Interactive CLI — manual proof exploration. Type help for commands."
+    intro = "Tamarin Interactive CLI — proof exploration. Type help for commands."
     prompt = "tamarin> "
 
     def __init__(
@@ -205,6 +205,41 @@ class TamarinShell(cmd.Cmd):
             self._print("Choose a branch with b <id>.")
         self._show_state(response, show_branches=len(generated) <= 1)
 
+    def do_auto(self, argument: str) -> None:
+        """auto [k]: Apply up to k ranked methods, or run without a step limit.
+
+        Search unfinished branches depth-first within the selected subtree.
+        Existing steps are retained; a completed run is one undo entry.
+        Navigation and engine-recognized terminal cases do not consume steps.
+        Zero steps only displays the current state. Unbounded search may loop;
+        Ctrl-C cancels it, restoring the pre-auto proof and returning to the prompt.
+        """
+        arguments = shlex.split(argument)
+        usage = "Usage: auto [k]; k must be a non-negative integer"
+        if len(arguments) > 1:
+            raise ValueError(usage)
+        limit = None
+        if arguments:
+            try:
+                limit = int(arguments[0])
+            except ValueError as exc:
+                raise ValueError(usage) from exc
+            if limit < 0:
+                raise ValueError(usage)
+
+        self._print("Running auto; press Ctrl-C to cancel.")
+        self.stdout.flush()
+        response = self.client.auto(limit)
+        if response["auto_reason"] == "cancelled":
+            self._print("Auto cancelled; proof unchanged.")
+        else:
+            reason = (
+                "step limit reached" if response["auto_reason"] == "step_limit"
+                else "no further applicable steps in selected subtree"
+            )
+            self._print(f"Auto: {response['auto_steps']} step(s); {reason}.")
+        self._show_state(response)
+
     def do_branches(self, argument: str) -> None:
         """branches: List immediate child branches, their IDs, and statuses."""
         self._arguments(argument, 0, "branches")
@@ -223,7 +258,7 @@ class TamarinShell(cmd.Cmd):
         self._show_state(self.client.back())
 
     def do_undo(self, argument: str) -> None:
-        """undo: Undo the last apply/reset mutation, restoring its prior selection.
+        """undo: Undo the last apply/auto/reset, restoring its prior selection.
 
         History spans the session; navigation alone is not a mutation.
         """
@@ -233,7 +268,7 @@ class TamarinShell(cmd.Cmd):
     def do_redo(self, argument: str) -> None:
         """redo: Restore the last undone mutation and its resulting selection.
 
-        A new successful apply or reset clears redo history.
+        A new successful proof mutation clears redo history.
         """
         self._arguments(argument, 0, "redo")
         self._show_state(self.client.redo())
@@ -274,7 +309,7 @@ class TamarinShell(cmd.Cmd):
         self._print("* current node")
 
     def do_save(self, argument: str) -> None:
-        """save <file.spthy>: Save the native theory and manually built proofs.
+        """save <file.spthy>: Save the native theory and recorded proofs.
 
         Unfinished branches remain unfinished; saving does not prove them.
         """
@@ -338,10 +373,10 @@ class TamarinShell(cmd.Cmd):
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    """Run the manual proof terminal; return a conventional process exit code."""
+    """Run the proof terminal; return a conventional process exit code."""
     parser = argparse.ArgumentParser(
         prog="tamarin-cli",
-        description="Manually explore Tamarin proofs; no proof methods run automatically.",
+        description="Explore Tamarin proofs manually or with the auto command.",
         epilog="Quote REPL paths containing spaces. Use help inside the REPL for commands.",
     )
     parser.add_argument("file", nargs="?", help="native .spthy theory to load initially")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the checkout's manual proof CLI without installing its Python package."""
+"""Run the checkout's proof CLI without installing its Python package."""
 
 from pathlib import Path
 import sys
