@@ -8,8 +8,10 @@ from .client import (
     TamarinClient,
     TamarinError,
 )
+from .agent import AgentSession
 
 __all__ = [
+    "AgentSession",
     "TamarinClient",
     "TamarinError",
     "BackendError",

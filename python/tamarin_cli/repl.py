@@ -215,6 +215,49 @@ class TamarinShell(cmd.Cmd):
             self._print("Constraints:")
             self._print(json.dumps(response["constraints"], ensure_ascii=False, indent=2))
 
+    def do_graph(self, argument: str) -> None:
+        """graph [--json]: Show constraint graph nodes, facts, then typed edges.
+
+        Graph rule-node IDs are not proof-tree IDs and cannot be used with goto.
+        Edge ports cN and pN index conclusions and premises respectively (zero-based).
+        JSON prints only the exact backend response.
+        """
+        arguments = shlex.split(argument)
+        if arguments not in ([], ["--json"]):
+            raise ValueError("Usage: graph [--json]")
+        response = self.client.graph()
+        # Graph IDs do not authorize proof navigation or refresh method listings.
+        if arguments:
+            self._print(json.dumps(response, ensure_ascii=False))
+            return
+        self._print(
+            f"Lemma: {response['lemma']} | Proof node: {response['node_id']}"
+        )
+        self._print("Graph rule-node IDs are not proof-tree IDs for goto.")
+        self._print("Ports: cN = conclusion index, pN = premise index (zero-based).")
+        graph = response["graph"]
+        self._print("Nodes:")
+        for node in graph["nodes"]:
+            self._print(f"  {node['id']} [{node['type']}] {node['label']}")
+            for field, title, port in (
+                ("premises", "Premises", "p"),
+                ("actions", "Actions", "a"),
+                ("conclusions", "Conclusions", "c"),
+            ):
+                self._print(f"    {title}:")
+                for index, fact in enumerate(node[field]):
+                    text = str(fact["text"]).replace("\n", "\n        ")
+                    self._print(f"      {port}{index} [{fact['id']}] {text}")
+                if not node[field]:
+                    self._print("      (none)")
+        if not graph["nodes"]:
+            self._print("  (none)")
+        self._print("Edges:")
+        for edge in graph["edges"]:
+            self._print(f"  {edge['source']} --[{edge['type']}]--> {edge['target']}")
+        if not graph["edges"]:
+            self._print("  (none)")
+
     def do_goals(self, argument: str) -> None:
         """goals: List open goals at the current proof node."""
         self._arguments(argument, 0, "goals")

@@ -35,6 +35,7 @@ import Text.Read (readMaybe)
 import Text.PrettyPrint.Class (render)
 import Theory
 import Theory.Constraint.Solver.Goals (openGoals)
+import Theory.Constraint.System.JSON (sequentGraphValue)
 import Theory.Tools.Wellformedness (prettyWfErrorReport)
 
 -- The original open theory is deliberately retained: opening a closed SAPIC
@@ -390,6 +391,12 @@ dispatch opts revision previous (Request command text index expectedRevision)
         "frontier" -> do
           (name, proof, _, _) <- selection session
           unchanged session ["lemma" .= name, "frontier" .= frontierValues "0" proof]
+        "graph" -> do
+          (name, proof, path, node) <- selection session
+          sys <- require "No annotated constraint system at this node" $ psInfo (root node)
+          unchanged session
+            ["lemma" .= name, "node_id" .= nodeId proof path,
+             "graph" .= sequentGraphValue name sys]
         "branch" -> do
           (name, _, path, node) <- selection session
           i <- require "Missing branch_id" index

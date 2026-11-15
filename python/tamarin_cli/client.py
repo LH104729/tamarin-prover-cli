@@ -24,6 +24,7 @@ import shlex
 import signal
 import shutil
 import subprocess
+import threading
 from typing import Any, Dict, Optional, Sequence, TextIO, Union
 
 
@@ -32,9 +33,10 @@ class TamarinError(Exception):
 
 
 class BackendError(TamarinError):
-    """A rejected command; the backend session remains available.
+    """A structured rejected command.
 
-    ``response`` retains the entire backend error object for API callers.
+    ``response`` retains the entire error object for API callers.
+    ``recoverable`` indicates whether the session remains available.
     """
 
     def __init__(self, response: Dict[str, Any]) -> None:
@@ -52,6 +54,10 @@ class BackendUnavailableError(TamarinError):
 
 class ProtocolError(TamarinError):
     """The backend exited or returned something other than a protocol response."""
+
+
+class ResponseLimitError(ProtocolError):
+    """The backend exceeded the configured wire response byte limit."""
 
 
 class ClientClosedError(TamarinError):
@@ -107,6 +113,12 @@ class TamarinClient:
     ``start()`` and context entry start the backend; the first request also starts
     it when necessary. Backend stderr is inherited by default, never parsed as
     JSON. Pass a file object as ``stderr`` to redirect diagnostics explicitly.
+
+    Safety-layer callers may disable SIGINT handling for worker-thread use and
+    cap the wire response before decoding. ``process_prefix`` supports an exec
+    launcher, ``cwd`` selects its working directory, and ``kill_process_group``
+    makes shutdown release descendants too. ``abort_event`` prevents a startup
+    racing with external termination from leaving an unowned process.
     """
 
     def __init__(
@@ -114,12 +126,30 @@ class TamarinClient:
         backend: Optional[Union[str, Sequence[str]]] = None,
         *,
         stderr: Optional[TextIO] = None,
+        handle_sigint: bool = True,
+        max_response_bytes: Optional[int] = None,
+        process_prefix: Sequence[str] = (),
+        cwd: Optional[Union[str, os.PathLike[str]]] = None,
+        kill_process_group: bool = False,
+        abort_event: Optional[threading.Event] = None,
     ) -> None:
         self._backend = backend
         self._stderr = stderr
+        if max_response_bytes is not None and (
+            type(max_response_bytes) is not int or max_response_bytes <= 0
+        ):
+            raise ValueError("max_response_bytes must be a positive integer or None")
+        self._handle_sigint = handle_sigint
+        self._max_response_bytes = max_response_bytes
+        self._process_prefix = list(process_prefix)
+        self._cwd = cwd
+        self._kill_group = kill_process_group
+        self._abort_event = abort_event
         self._process: Optional[subprocess.Popen[str]] = None
         self._closed = False
         self._revision: Optional[int] = None
+        self._group_killed = False
+        self._group_kill_lock = threading.Lock()
 
     @property
     def revision(self) -> Optional[int]:
@@ -153,7 +183,9 @@ class TamarinClient:
         if self._closed:
             raise ClientClosedError("The backend session is closed")
         if self._process is None:
-            command = backend_command(self._backend)
+            if self._abort_event is not None and self._abort_event.is_set():
+                raise ClientClosedError("The backend session was terminated")
+            command = self._process_prefix + backend_command(self._backend)
             try:
                 self._process = subprocess.Popen(
                     command,
@@ -166,9 +198,14 @@ class TamarinClient:
                     # Terminal Ctrl-C belongs to the frontend. Forward it as
                     # protocol cancellation, not a process-killing signal.
                     start_new_session=True,
+                    cwd=self._cwd,
                 )
             except OSError as exc:
                 raise BackendUnavailableError(f"Cannot start backend {command[0]!r}: {exc}") from exc
+            if self._abort_event is not None and self._abort_event.is_set():
+                self._kill_process_group()
+                self._shutdown(send_quit=False)
+                raise ClientClosedError("The backend session was terminated")
         return self
 
     def request(self, command: str, **parameters: Any) -> Dict[str, Any]:
@@ -176,11 +213,13 @@ class TamarinClient:
 
         Commands are never retried: retrying a mutation could apply it twice.
         A protocol failure closes the client instead of silently losing or
-        replacing the backend's proof session. Apply, step, and auto handle
-        Ctrl-C as cancellation and must be called on the main thread.
+        replacing the backend's proof session. By default apply, step, and auto
+        handle Ctrl-C as cancellation and must be called on the main thread;
+        ``handle_sigint=False`` disables that terminal-only behavior.
         """
         return self._request(
-            command, parameters, interruptible=command in ("apply", "step", "auto")
+            command, parameters,
+            interruptible=self._handle_sigint and command in ("apply", "step", "auto"),
         )
 
     def _request(
@@ -217,9 +256,8 @@ class TamarinClient:
             raise BackendError(response)
         return response
 
-    @staticmethod
     def _exchange(
-        process: subprocess.Popen[str], payload: str, *, interruptible: bool
+        self, process: subprocess.Popen[str], payload: str, *, interruptible: bool
     ) -> str:
         assert process.stdin is not None and process.stdout is not None
         sent = False
@@ -248,7 +286,16 @@ class TamarinClient:
                 send_cancel()
             # Drain the original response even after cancellation, keeping the
             # JSON-lines stream aligned for the next interactive command.
-            return process.stdout.readline()
+            if self._max_response_bytes is None:
+                return process.stdout.readline()
+            # Bound bytes before decoding/JSON parsing, including a response
+            # that never terminates its line. Do not mix text and binary reads.
+            data = process.stdout.buffer.readline(self._max_response_bytes + 1)
+            if len(data) > self._max_response_bytes:
+                self._kill_process_group()
+                self._shutdown(send_quit=False)
+                raise ResponseLimitError("Backend response exceeds max_response_bytes")
+            return data.decode("utf-8")
         finally:
             if interruptible:
                 signal.signal(signal.SIGINT, previous)
@@ -268,6 +315,10 @@ class TamarinClient:
     def observe(self, detail: str = "compact") -> Dict[str, Any]:
         """Inspect the selected node with compact, goals, or full detail."""
         return self.request("observe", detail=detail)
+
+    def graph(self) -> Dict[str, Any]:
+        """Inspect the selected proof node's expanded GUI constraint graph."""
+        return self.request("graph")
 
     def state(self, detail: str = "compact") -> Dict[str, Any]:
         """Inspect the selected node; request full detail for native state text."""
@@ -366,6 +417,19 @@ class TamarinClient:
         """End the session, including on REPL EOF; safe to call repeatedly."""
         self._shutdown(send_quit=True)
 
+    def _kill_process_group(self) -> None:
+        """Terminate the owned group once, even when deadline and close race."""
+        with self._group_kill_lock:
+            if self._group_killed:
+                return
+            process = self._process
+            if process is not None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                self._group_killed = True
+
     def _shutdown(self, *, send_quit: bool) -> None:
         if self._closed:
             return
@@ -373,6 +437,11 @@ class TamarinClient:
         process = self._process
         if process is None:
             return
+        if self._kill_group:
+            # A proof session can own oracle children even after its leader
+            # exits. Closing a safety-layer client always releases that group.
+            self._kill_process_group()
+            send_quit = False
         if process.stdin is not None:
             try:
                 if send_quit and process.poll() is None:

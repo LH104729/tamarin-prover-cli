@@ -32,6 +32,7 @@ module Theory.Constraint.System.JSON (
     writeSequentAsJSONToFile,
     sequentsToJSONPretty,
     writeSequentAsJSONPrettyToFile
+    , sequentGraphValue
   ) where
 import           Extension.Data.Label       as L (get)
 import           Data.Aeson
@@ -441,6 +442,31 @@ sequentsToJSONGraphs pretty systems =
     JSONGraphs {
       graphs = jsonGraphs
     }
+
+-- | Expanded constraint graph for textual/API consumers. Reuse the GUI graph
+-- model and edge classification, but do not hide rule instances or facts with
+-- display simplification, compression, clustering, or term abbreviations.
+sequentGraphValue :: String -> System -> Value
+sequentGraphValue label system =
+  let options = defaultGraphOptions
+        { _goSimplificationLevel = SL0, _goClustering = False
+        , _goAbbreviate = False, _goCompress = False, _goShowAutoSource = True }
+      graph = runReader (sequentToJSONGraph label) (True, systemToGraph system options)
+      nodeValue node = object
+        [ "id" .= jgnId node, "type" .= jgnType node, "label" .= jgnLabel node
+        , "premises" .= maybe [] (map factValue . jgnPrems) (jgnMetadata node)
+        , "actions" .= maybe [] (map factValue . jgnActs) (jgnMetadata node)
+        , "conclusions" .= maybe [] (map factValue . jgnConcs) (jgnMetadata node)
+        ]
+      factValue fact = object
+        [ "id" .= jgnFactId fact, "text" .= jgnFactShow fact
+        , "name" .= jgnFactName fact, "multiplicity" .= jgnFactMult fact ]
+      edgeValue edge = object
+        [ "source" .= jgeSource edge, "target" .= jgeTarget edge
+        , "type" .= jgeRelation edge ]
+  in object ["nodes" .= map nodeValue (jgNodes graph),
+             "edges" .= map edgeValue (jgEdges graph)]
+
 
 -- | Generate JSON bytestring from an abstract graph.
 sequentsToJSON :: GraphOptions -> [(String, System)] -> String

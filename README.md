@@ -47,6 +47,7 @@ The REPL supports:
 | `undo` (`u`), `redo` (`r`) | Reverse the last proof mutation or restore it |
 | `reset` | Replace the selected step and descendants with `sorry` |
 | `tree` (`t`) | Display the selected lemma's complete proof tree |
+| `graph [--json]` | List the selected constraint graph's rule nodes, facts, and typed edges |
 | `save` (`w`), `check` (`c`) | Save native `.spthy`; replay recorded steps and report proof completeness |
 | `help` (`h`), `quit` (`q`) | Command help; exit without automatically saving |
 
@@ -72,6 +73,32 @@ branches and enters a sole child automatically, without executing another proof
 method. For multiple children it stays at the parent; use `b <id>` to choose.
 Unnamed children are displayed as `(continuation)`. Switch siblings with `back`,
 then `branch <id>`. Lemma switches retain each lemma's tree and cursor.
+
+`graph` prints the current constraint graph as a node list (rule name/type,
+premises, action facts, and conclusions), followed by an edge list. It reuses
+the GUI graph model, fully expanded without display simplification, compression,
+clustering, or abbreviations. No Graphviz executable is required.
+`graph --json` prints the same observation as structured JSON:
+`{status, revision, lemma, node_id, graph: {nodes, edges}}`.
+Each edge has `source`, `target`, and `type`. Native edge types are:
+
+| Type | Meaning |
+| --- | --- |
+| `ProtoFact` | Linear protocol-fact dependency |
+| `PersistentFact` | Persistent-fact dependency |
+| `KFact` | Intruder-knowledge fact dependency |
+| `default` | Other fact dependency |
+| `LessAtoms` | Temporal ordering constraint |
+| `unsolvedChain` | Unresolved destruction-chain dependency |
+
+Fact-flow endpoints such as `#vr:c0` and `#i:p0` identify a rule instance's
+zero-based conclusion or premise. Ordering edges connect rule-node IDs directly.
+These IDs are **not** proof-tree node IDs accepted by `goto`; the outer `node_id`
+identifies the selected proof-tree node. Graph inspection is read-only and does
+not invalidate method or navigation revisions. At an initial proof node there
+may be no instantiated rules yet; inspect a child state to see its constraints.
+Both `TamarinClient.graph()` and `AgentSession.graph()` return this observation.
+
 
 `frontier` lists unfinished `sorry` leaves in the entire selected lemma,
 excluding completed branches and internal nodes. `goto 0.1.0` selects a node
@@ -218,6 +245,91 @@ Run the real-engine integration regressions after building:
 ```sh
 PYTHONPATH=python python3 -m unittest discover -s python/tests -v
 ```
+
+### Agent sessions and optional MCP server
+
+`AgentSession` adds workspace-confined file operations and bounded execution to
+the existing Python client. It owns one persistent proof session and serializes
+calls, including calls from worker threads; no terminal or SIGINT handler is
+needed. It never chooses a method or retries a mutation on an agent's behalf.
+
+```python
+from tamarin_cli import AgentSession
+
+with AgentSession("/absolute/path/to/theories") as agent:
+    agent.load("example.spthy")
+    observation = agent.lemma("secrecy")
+    # Inspect observation["methods"] before choosing a method_id.
+    # agent.apply(method_id, revision=observation["revision"], timeout_ms=5000)
+    pending = agent.frontier()
+    # agent.goto(node_id, revision=pending["revision"])
+    agent.save("partial.spthy")
+```
+
+Install the optional [official MCP SDK](https://py.sdk.modelcontextprotocol.io/)
+extra with Python 3.10 or newer (the base CLI still needs only Python 3.9):
+
+```sh
+python3 -m pip install './python[mcp]'
+tamarin-mcp --workspace /absolute/path/to/theories
+# From a checkout with the extra installed:
+PYTHONPATH=python python3 -m tamarin_cli.mcp_server --workspace /absolute/path/to/theories
+```
+
+The server uses **stdio only**; its stdout is reserved for MCP messages and
+backend diagnostics go to stderr. Configure an MCP host with an absolute
+executable and workspace path, for example:
+
+```json
+{
+  "mcpServers": {
+    "tamarin": {
+      "command": "/absolute/path/to/venv/bin/tamarin-mcp",
+      "args": ["--workspace", "/absolute/path/to/theories"]
+    }
+  }
+}
+```
+
+Tools are `tamarin_load`, `tamarin_lemma`, `tamarin_observe`, `tamarin_apply`,
+`tamarin_graph`, `tamarin_frontier`, `tamarin_goto`, `tamarin_save`, and `tamarin_check`.
+`tamarin_lemma(name)` selects a lemma after loading; `observe` defaults to
+compact detail. Apply and goto require the revision of the selected method or
+node listing. Tool results expose the backend dictionary as structured content;
+errors retain their structured codes and set MCP `isError`. One backend persists
+across tool calls and is closed when the server exits.
+
+Safety configuration (also constructor keywords on `AgentSession`):
+
+| CLI option | Python keyword | Default | Scope |
+| --- | --- | --- | --- |
+| `--timeout-ms` | `timeout_ms` | 30000 | Per-operation wall-time budget; apply gets a native rollback-capable timeout |
+| `--cpu-seconds` | `cpu_seconds` | 300 | POSIX cumulative CPU limit per backend/descendant process |
+| `--max-file-bytes` | `max_file_bytes` | 8388608 | Maximum theory input and native output file size |
+| `--max-response-bytes` | `max_response_bytes` | 8388608 | Maximum backend response size |
+
+`--backend` selects a trusted executable prefix, as with the terminal CLI.
+These settings belong to the server operator, not individual tool calls.
+An apply timeout may be shortened but cannot exceed the configured budget.
+Apply permits one additional second for native timeout rollback before forcing
+termination.
+A native apply timeout leaves the proof session intact. A hard transport
+deadline or response-size violation terminates the backend process group and
+invalidates the session; unsaved work is lost and there is no automatic restart.
+
+The safety layer requires POSIX. Paths resolve beneath the required workspace;
+escaping traversal/symlinks, non-regular inputs, and non-`.spthy` files are
+rejected. Save requires an existing parent and can replace an existing proof
+file. These are API restrictions, **not an OS sandbox**: theories can invoke
+external ranking oracles, filesystem checks do not defend against hostile
+concurrent filesystem changes, and CPU limits are per process, not aggregate
+process-tree accounting. Use trusted theories/oracles and a container or
+separate OS account for untrusted workloads. Memory is not capped by this layer.
+
+Run the integration command above in an environment with the MCP extra to
+include the real stdio MCP regression. Without the extra, only that regression
+is skipped; agent-session and native proof integration checks still run.
+
 
 
 
