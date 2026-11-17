@@ -189,6 +189,13 @@ A remaining `sorry` always makes the CLI's result incomplete, even if another
 branch already contains a witness; the original prover retains its own
 quantifier-specific reporting.
 
+Ordinary `apply`, `auto`, and `reset` update only the selected proof, preserving
+annotations and shared data in untouched subtrees and lemmas. They do not replay
+the theory after each step. Full replay remains part of explicit `check` and
+theory loading/rebuilding. A complete dependent proof is not reported verified
+while a required reusable/source lemma is unfinished or invalid; source
+prerequisites include declarations appearing later in the file.
+
 Saving preserves source theory declarations and native proof scripts, not
 original whitespace. Partial proofs retain explicit `sorry` branches. Saved
 files can be reloaded here, opened in the original GUI, or checked by the

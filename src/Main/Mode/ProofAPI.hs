@@ -14,7 +14,7 @@ import Data.Aeson.Types (Pair, Parser, parseEither)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as BL
 import Data.Label qualified as L
-import Data.List (foldl', intercalate, isPrefixOf)
+import Data.List (foldl', intercalate, isPrefixOf, partition)
 import Data.Map.Strict qualified as M
 import Data.Monoid (Any (..))
 import Data.Maybe (fromMaybe, isNothing)
@@ -611,12 +611,18 @@ replay = proveTheory (const True) (checkAndExtendProver (sorryProver Nothing))
 
 installProof :: Session -> String -> IncrementalProof -> IO Session
 installProof session name proof = do
-  thy <- require "Could not replace lemma proof" $ modifyLemma
-    (\lemma -> if L.get lName lemma == name then L.set lProof proof lemma else lemma)
-    (currentTheory session)
-  -- Rebuild all proof annotations in declaration order, including subsequent
-  -- reuse/source contexts. Native checking retains invalidated old subtrees.
-  refresh session { currentTheory = replay thy }
+  -- oneStepProver has already executed the method and annotated its generated
+  -- cases; reset likewise retains the selected node's annotation. Install that
+  -- proof through the native single-lemma update, preserving untouched trees.
+  thy <- require "Could not replace lemma proof" $
+    modifyLemmaProof (mapProverProof (const proof) mempty) name (currentTheory session)
+  -- Proof bodies do not change mkSystem's reusable formulas or cached source
+  -- cases: those depend on declarations, which mutateLemma rebuilds separately.
+  -- Dependents keep their annotations (including invalid/unreachable steps),
+  -- while resultTable still requires their reusable/source prerequisites to be
+  -- verified. Replaying here would both destroy sharing and recheck unrelated
+  -- proof steps; full replay belongs to explicit check and theory rebuilds.
+  refresh session { currentTheory = thy }
 
 -- A budget counts method applications across the entire selected subtree,
 -- not proof depth. Recorded steps are traversed, never replaced. The private
@@ -841,11 +847,16 @@ lemmaValues thy =
 checkedResult :: ClosedTheory -> Lemma IncrementalProof -> (String, String)
 checkedResult thy lemma = resultTable thy M.! L.get lName lemma
 
--- Compute prerequisite results once in declaration order, rather than
--- recursively replaying a shared chain of reuse dependencies for each lemma.
+-- Source proofs use raw sources and can reuse only earlier source lemmas.
+-- Check their results first: refined-source proofs depend on every source
+-- declaration, including later ones. Ordinary reuse still follows declaration
+-- order, so both passes are acyclic and each proof is summarized only once.
 resultTable :: ClosedTheory -> M.Map String (String, String)
-resultTable thy = foldl' add M.empty (theoryLemmas thy)
+resultTable thy = foldl' add sourceResults ordinary
   where
+    (sources, ordinary) = partition
+      ((SourceLemma `elem`) . L.get lAttributes) (theoryLemmas thy)
+    sourceResults = foldl' add M.empty sources
     add results lemma = M.insert (L.get lName lemma) (localResult thy results lemma) results
 
 localResult :: ClosedTheory -> M.Map String (String, String)
@@ -869,8 +880,12 @@ localResult thy results lemma
            _ -> False
     ctxt = getProofContext lemma thy
     hidden = L.get pcHiddenLemmas ctxt
+    (previous, remaining) = break ((== L.get lName lemma) . L.get lName) (theoryLemmas thy)
+    laterSources
+      | SourceLemma `elem` L.get lAttributes lemma = []
+      | otherwise = filter ((SourceLemma `elem`) . L.get lAttributes) (drop 1 remaining)
     blockers = [L.get lName prior
-      | prior <- takeWhile ((/= L.get lName lemma) . L.get lName) (theoryLemmas thy)
+      | prior <- previous ++ laterSources
       , (SourceLemma `elem` L.get lAttributes prior && SourceLemma `notElem` L.get lAttributes lemma) ||
           (ReuseLemma `elem` L.get lAttributes prior && L.get lTraceQuantifier prior == AllTraces
            && (SourceLemma `elem` L.get lAttributes prior || SourceLemma `notElem` L.get lAttributes lemma)
