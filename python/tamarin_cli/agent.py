@@ -257,6 +257,18 @@ class AgentSession:
         if type(value) is not int or not 0 <= value <= sys.maxsize:
             raise self._failure("INVALID_REQUEST", f"{name} must be a non-negative integer")
 
+    def _source(self, source: Any) -> None:
+        if not isinstance(source, str):
+            raise self._failure("INVALID_REQUEST", "source must be a string")
+        if len(source) > self._max_file_bytes:
+            raise self._failure("RESOURCE_LIMIT", "Lemma source exceeds max_file_bytes")
+        try:
+            size = len(source.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise self._failure("INVALID_REQUEST", "source must be valid UTF-8 text") from exc
+        if size > self._max_file_bytes:
+            raise self._failure("RESOURCE_LIMIT", "Lemma source exceeds max_file_bytes")
+
     def load(self, file: Union[str, os.PathLike[str]]) -> Dict[str, Any]:
         return self._invoke(lambda: self._client.load(self._path(file, saving=False)))
 
@@ -265,6 +277,33 @@ class AgentSession:
             if not isinstance(name, str):
                 raise self._failure("INVALID_REQUEST", "name must be a string")
             return self._client.lemma(name)
+        return self._invoke(operation)
+
+    def add(self, source: str, *, revision: int) -> Dict[str, Any]:
+        """Add an in-memory native lemma declaration within the session bounds."""
+        def operation() -> Dict[str, Any]:
+            self._integer("revision", revision)
+            self._source(source)
+            return self._client.add(source, revision=revision)
+        return self._invoke(operation)
+
+    def edit(self, name: str, source: str, *, revision: int) -> Dict[str, Any]:
+        """Replace a native lemma declaration without reading a source file."""
+        def operation() -> Dict[str, Any]:
+            self._integer("revision", revision)
+            if not isinstance(name, str):
+                raise self._failure("INVALID_REQUEST", "name must be a string")
+            self._source(source)
+            return self._client.edit(name, source, revision=revision)
+        return self._invoke(operation)
+
+    def delete(self, name: str, *, revision: int) -> Dict[str, Any]:
+        """Delete a lemma within the session's hard wall deadline."""
+        def operation() -> Dict[str, Any]:
+            self._integer("revision", revision)
+            if not isinstance(name, str):
+                raise self._failure("INVALID_REQUEST", "name must be a string")
+            return self._client.delete(name, revision=revision)
         return self._invoke(operation)
 
     def observe(self, detail: str = "compact") -> Dict[str, Any]:

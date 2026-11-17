@@ -28,7 +28,7 @@ def create_server(
 ) -> Any:
     """Create an official MCPServer without starting a backend or a listener.
 
-    One AgentSession is owned by the server lifespan. All nine tools share it;
+    One AgentSession is owned by the server lifespan. All twelve tools share it;
     cancellation waits for an in-flight operation before releasing serialization.
     A hard resource violation permanently invalidates that session, without retry
     or automatic restart. Configuration cannot be changed through tools.
@@ -110,6 +110,10 @@ def create_server(
             "revision. Use frontier and goto to navigate. Use graph to inspect "
             "constraint rule nodes and typed edges; graph node IDs are not "
             "proof-tree IDs for goto. Never guess method IDs or revisions. "
+            "Use add/edit/delete with full native lemma declarations and the "
+            "latest observed session revision, not an older method-list revision. "
+            "Edits may rename a lemma; new and replaced proofs start as sorry. "
+            "Declaration changes stay in memory until save. "
             "A cancelled call may have completed: observe before continuing. "
             "A non-recoverable error requires a new server session. "
             "Files are confined to the configured workspace; saving overwrites "
@@ -144,6 +148,33 @@ def create_server(
     async def tamarin_lemma(name: str) -> CallToolResult:
         """Select or resume a named lemma without applying a proof method."""
         return await invoke("lemma", name)
+
+    @server.tool(structured_output=False)
+    async def tamarin_add(source: str, revision: int) -> CallToolResult:
+        """Append and select one full native lemma declaration; save to persist.
+
+        Example source: lemma extra: exists-trace "Ex x #i. Pick(x) @ i"
+        Literal newlines are allowed. Pass the latest observed session revision.
+        Optional proof skeletons are ignored; the new proof starts as sorry.
+        """
+        return await invoke("add", source, revision=revision)
+
+    @server.tool(structured_output=False)
+    async def tamarin_edit(name: str, source: str, revision: int) -> CallToolResult:
+        """Replace a lemma in place using a full native declaration, possibly renaming it.
+
+        Pass the latest observed session revision. The replacement is selected
+        with a fresh sorry proof; changes stay in memory until save.
+        """
+        return await invoke("edit", name, source, revision=revision)
+
+    @server.tool(structured_output=False)
+    async def tamarin_delete(name: str, revision: int) -> CallToolResult:
+        """Delete a lemma at the latest session revision; save to persist the change.
+
+        Deleting the selected lemma clears the selection, not the theory.
+        """
+        return await invoke("delete", name, revision=revision)
 
     @server.tool(structured_output=False)
     async def tamarin_observe(detail: str = "compact") -> CallToolResult:
@@ -202,7 +233,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--backend", help="Shell-quoted backend command prefix (not a shell script)")
     parser.add_argument("--timeout-ms", type=int, default=30000, help="Per-operation wall-time budget in milliseconds")
     parser.add_argument("--cpu-seconds", type=int, default=300, help="Cumulative backend CPU budget in seconds")
-    parser.add_argument("--max-file-bytes", type=int, default=8388608, help="Maximum native input/output file size")
+    parser.add_argument("--max-file-bytes", type=int, default=8388608, help="Maximum native input/output file or lemma source size in UTF-8 bytes")
     parser.add_argument("--max-response-bytes", type=int, default=8388608, help="Maximum backend protocol response size")
     options = parser.parse_args(argv)
     try:

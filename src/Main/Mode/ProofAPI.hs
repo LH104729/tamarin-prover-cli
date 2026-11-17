@@ -36,6 +36,7 @@ import Text.PrettyPrint.Class (render)
 import Theory
 import Theory.Constraint.Solver.Goals (openGoals)
 import Theory.Constraint.System.JSON (sequentGraphValue)
+import Theory.Text.Parser (parseSingleLemmaWithMacros)
 import Theory.Tools.Wellformedness (prettyWfErrorReport)
 
 -- The original open theory is deliberately retained: opening a closed SAPIC
@@ -54,7 +55,7 @@ data Session = Session
 -- its history stacks. Native theories and proofs are shared, not copied.
 -- Strict fields also prevent selector thunks from retaining an old Session.
 data Snapshot = Snapshot
-  !ClosedTheory !(Maybe String) !(M.Map String ProofPath) ![ProofMethod]
+  !OpenTheory !ClosedTheory !(Maybe String) !(M.Map String ProofPath) ![ProofMethod]
 
 data Mutation = Mutation !Snapshot !Snapshot
 
@@ -65,6 +66,7 @@ data Request = Request String (Maybe String) (Maybe Int) (Maybe Integer)
   | ObserveRequest Detail
   | ApplyRequest Int Integer (Maybe Int)
   | GotoRequest String Integer
+  | LemmaRequest String (Maybe String) (Maybe String) Integer
 
 data APIError = APIError String String Bool String deriving Show
 
@@ -238,6 +240,7 @@ prepareResponse revision next fields stop = do
     Nothing -> pure ()
     Just session -> do
       _ <- evaluate (force (currentTheory session))
+      _ <- evaluate (force (sourceTheory session))
       _ <- evaluate (force (cachedMethods session))
       pure ()
   bytes <- evaluate (force (encode (success revision fields)))
@@ -250,6 +253,11 @@ parseRequest = withObject "request" $ \o -> do
     "load" -> Request command . Just <$> o .: "file" <*> pure Nothing <*> pure Nothing
     "save" -> Request command . Just <$> o .: "file" <*> pure Nothing <*> pure Nothing
     "lemma" -> Request command . Just <$> o .: "name" <*> pure Nothing <*> pure Nothing
+    "add" -> LemmaRequest command Nothing . Just <$> o .: "source" <*> o .: "expected_revision"
+    "edit" -> LemmaRequest command . Just <$> o .: "name" <*> (Just <$> o .: "source")
+      <*> o .: "expected_revision"
+    "delete" -> LemmaRequest command . Just <$> o .: "name" <*> pure Nothing
+      <*> o .: "expected_revision"
     "apply" -> parseApply o
     "step" -> parseApply o
     "goto" -> GotoRequest <$> o .: "node_id" <*> o .: "expected_revision"
@@ -284,6 +292,7 @@ changesRevision (AutoRequest _) = False
 changesRevision (ApplyRequest _ _ _) = True
 changesRevision (GotoRequest _ _) = True
 changesRevision (ObserveRequest _) = False
+changesRevision (LemmaRequest _ _ _ _) = True
 
 apiFailure :: String -> String -> Bool -> String -> IO a
 apiFailure code message recoverable action =
@@ -337,6 +346,12 @@ dispatch _ revision previous (GotoRequest ident expected) = do
   pure (Just next, fields, False)
 dispatch opts revision previous (ApplyRequest method expected _) =
   dispatch opts revision previous (Request "apply" Nothing (Just method) (Just expected))
+dispatch opts revision previous (LemmaRequest command name source expected) = do
+  when (expected /= revision) $
+    apiFailure "STALE_REVISION" "Theory revision changed; refresh before editing lemmas" True "lemmas"
+  session <- require "No theory loaded; use load first" previous
+  (next, fields) <- mutateLemma opts session command name source
+  pure (Just (rememberMutation session next), fields, False)
 dispatch opts revision previous (Request command text index expectedRevision)
   | command == "apply" && expectedRevision /= Just revision =
       apiFailure "STALE_REVISION" "Stale expected_revision; refresh state or methods before applying a method" True "observe"
@@ -439,13 +454,13 @@ dispatch opts revision previous (Request command text index expectedRevision)
           change@(Mutation before _) : rest -> do
             let next = (restoreSnapshot before session)
                   { undoHistory = rest, redoHistory = change : redoHistory session }
-            selected next []
+            historyResponse next
         "redo" -> case redoHistory session of
           [] -> apiError "There is no mutation to redo"
           change@(Mutation _ after) : rest -> do
             let next = (restoreSnapshot after session)
                   { undoHistory = change : undoHistory session, redoHistory = rest }
-            selected next []
+            historyResponse next
         "reset" -> do
           (name, proof, path, node) <- selection session
           when (isSorry node && M.null (children node)) $
@@ -473,6 +488,87 @@ dispatch opts revision previous (Request command text index expectedRevision)
     selected session extra = do
       fields <- stateFields Compact session
       unchanged session (fields ++ extra)
+    historyResponse session = case selectedLemma session of
+      Just _ -> selected session (lemmaSessionFields session)
+      Nothing -> unchanged session (lemmaSessionFields session)
+
+lemmaSessionFields :: Session -> [Pair]
+lemmaSessionFields session =
+  ["theory" .= L.get thyName (currentTheory session),
+   "lemmas" .= lemmaValues (currentTheory session),
+   "selected_lemma" .= selectedLemma session]
+
+-- Declaration changes rebuild the native closed theory: source lemmas affect
+-- cached source cases, so merely replacing a formula in ClosedTheory is unsafe.
+-- Only this private candidate is rebuilt; the event loop commits it atomically.
+mutateLemma :: Loader.TheoryLoadOptions -> Session -> String -> Maybe String -> Maybe String
+            -> IO (Session, [Pair])
+mutateLemma opts session command oldName source = do
+  let original = nativeTheory session
+      invalid message = apiFailure "INVALID_LEMMA" message True "lemmas"
+  old <- case oldName of
+    Nothing -> pure Nothing
+    Just name -> Just <$> maybe (invalid "No such lemma") pure (lookupLemma name original)
+  parsed <- case source of
+    Nothing -> pure Nothing
+    Just text -> do
+      lemma <- either (invalid . show) pure $ parseSingleLemmaWithMacros original text
+      _ <- either (invalid . render) pure $ formulaToGuarded (L.get lFormula lemma)
+      -- Like GUI editing, supplied proof scripts are not executed implicitly.
+      pure $ Just (L.set lProof (unproven ()) lemma)
+  let newName = L.get lName <$> parsed
+      affectedName = fromMaybe (fromMaybe "" oldName) newName
+  when (newName /= oldName && maybe False (\name -> isJustLemma name original) newName) $
+    apiFailure "LEMMA_EXISTS" "A lemma with the new name already exists" True "lemmas"
+  removed <- case oldName of
+    Nothing -> pure original
+    Just name -> maybe (invalid "Could not remove lemma") pure $ removeLemma name original
+  candidate <- case parsed of
+    Nothing -> pure removed
+    Just lemma -> case oldName of
+      Nothing -> maybe (invalid "Could not add lemma") pure $ addLemma lemma removed
+      Just name -> do
+        index <- maybe (invalid "No such lemma") pure $ lookupLemmaIndex name original
+        maybe (invalid "Could not replace lemma") pure $ addLemmaAtIndex lemma (index - 1) removed
+  let attributes = maybe [] (L.get lAttributes) old ++ maybe [] (L.get lAttributes) parsed
+      names = map (L.get lName) (theoryLemmas original)
+      subsequent = maybe [] (\name -> drop 1 $ dropWhile (/= name) names) oldName
+      invalidated
+        | SourceLemma `elem` attributes = filter (\name -> Just name /= oldName) names
+        | ReuseLemma `elem` attributes = subsequent
+        | otherwise = []
+      resetAffected lemma
+        | L.get lName lemma `elem` invalidated = L.set lProof (unproven ()) lemma
+        | otherwise = lemma
+  resetSource <- maybe (invalid "Could not reset dependent proofs") pure $
+    modifyLemma resetAffected candidate
+  closed <- runExceptT $ Loader.closeTheory ""
+    (opts { Loader.derivationChecks = 0, Loader.proveMode = False })
+    (L.get thySignature (currentTheory session)) (Left resetSource)
+  thy <- case closed of
+    Left err -> invalid (show err)
+    Right (_, Right _) -> invalid "Only trace lemmas are supported"
+    Right (warnings, Left result) -> do
+      unless (null warnings) $
+        hPutStrLn stderr $ "WARNING: theory wellformedness checks failed:\n"
+          ++ render (prettyWfErrorReport warnings)
+      evaluate (force result)
+  let selected = case newName of
+        Just name -> Just name
+        Nothing | selectedLemma session == oldName -> Nothing
+                | otherwise -> selectedLemma session
+      resetNames = invalidated ++ maybe [] pure oldName ++ maybe [] pure newName
+      paths = foldr M.delete (cursors session) resetNames
+  next <- refresh session { sourceTheory = resetSource, currentTheory = thy,
+                            selectedLemma = selected, cursors = paths }
+  state <- case selected of
+    Nothing -> pure []
+    Just _ -> stateFields Compact next
+  pure (next, lemmaSessionFields next ++ state ++
+    ["operation" .= command, "name" .= affectedName, "invalidated_lemmas" .= invalidated] ++
+    ["previous_name" .= name | command == "edit", Just name <- [oldName]])
+  where
+    isJustLemma name = not . isNothing . lookupLemma name
 
 atIndex :: Int -> [a] -> Maybe a
 atIndex i _ | i < 0 = Nothing
@@ -587,12 +683,12 @@ isSorry node = case psMethod (root node) of
   _ -> False
 
 snapshot :: Session -> Snapshot
-snapshot session = Snapshot (currentTheory session) (selectedLemma session)
+snapshot session = Snapshot (sourceTheory session) (currentTheory session) (selectedLemma session)
   (cursors session) (cachedMethods session)
 
 restoreSnapshot :: Snapshot -> Session -> Session
-restoreSnapshot (Snapshot thy lemma paths methods) session = session
-  { currentTheory = thy, selectedLemma = lemma, cursors = paths
+restoreSnapshot (Snapshot source thy lemma paths methods) session = session
+  { sourceTheory = source, currentTheory = thy, selectedLemma = lemma, cursors = paths
   , cachedMethods = methods
   }
 

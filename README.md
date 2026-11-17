@@ -38,6 +38,7 @@ The REPL supports:
 | Commands (shortcuts) | Operation |
 | --- | --- |
 | `load` (`ld`), `lemmas` (`ls`), `lemma` (`l`) | Load a native theory; list, select, or resume lemmas |
+| `add '<declaration>'`, `edit <name> '<declaration>'`, `delete <name>` | Add, replace/rename, or remove an in-memory native lemma |
 | `state [full]` (`s [full]`), `goals` (`g`), `methods` (`m`) | Show a compact summary or full native state; list goals or methods |
 | `observe [--detail compact\|goals\|full] [--json]` | Request structured observations at the chosen detail level |
 | `apply <id> [--timeout-ms N]` (`a <id> [--timeout-ms N]`) | Execute one selected method, optionally bounded by a positive millisecond timeout |
@@ -54,6 +55,46 @@ The REPL supports:
 Shortcuts accept the same arguments as their full commands, for example
 `ld "my theory.spthy"`, `l secrecy`, `a 0`, or `w "partial proof.spthy"`.
 `help` lists shortcuts; `help a` (or `h a`) shows help for `apply`.
+
+### Editing lemma declarations
+
+Pass exactly one full native lemma declaration, quoted as a single REPL
+argument. For a theory containing the action fact `Pick`, for example:
+
+```text
+add 'lemma extra: exists-trace "Ex x #i. Pick(x) @ i"'
+edit extra 'lemma renamed: all-traces "All x #i. Pick(x) @ i ==> x = x"'
+delete renamed
+undo
+save "edited.spthy"
+```
+
+Add appends a lemma; edit preserves its declaration position and may rename it.
+Both select the new declaration at its root with a fresh `sorry` proof. Supplied
+proof skeletons are parsed but not executed or retained, matching GUI editing.
+Tamarin validates syntax and guardedness and expands existing macros/predicates.
+Duplicate names, missing lemmas, trailing text, and stale revisions are rejected
+without changing the theory, selection, revision, or undo/redo history.
+
+Each successful declaration change is one undo entry, including the original
+statement, proof, and cursor. Deleting the selected lemma clears the selection;
+undo can restore it. Changes remain in memory until `save`; no source file is
+modified automatically.
+
+The native closed theory is rebuilt after each mutation. Editing/deleting a
+reusable lemma (or making an existing lemma reusable) conservatively resets
+later proofs to `sorry`. Adding, editing, or deleting a source lemma rebuilds
+source caches and conservatively resets all other existing proofs. The response
+lists these names in `invalidated_lemmas`; undo restores their old proofs.
+These resets persist in saved `.spthy`, so reloading cannot resurrect obsolete
+proofs.
+
+`TamarinClient` and `AgentSession` expose `add(source, revision=...)`,
+`edit(name, source, revision=...)`, and `delete(name, revision=...)`.
+Use the revision of the theory you inspected; the REPL supplies its latest
+observed revision. AgentSession applies the same wall deadline as other calls
+and bounds UTF-8 declaration size by `max_file_bytes`.
+
 
 State responses are compact by default at the backend, not merely shortened by
 the terminal: lemma, node, status, goal count, methods, child count, and branches.
@@ -107,9 +148,9 @@ paths rooted at `0`; `goto` requires the revision of the node listing. The REPL
 tracks it from observations, branches, tree, and frontier output. Refresh a
 listing after a state change; stale node references are rejected.
 
-`undo` reverses the last successful `apply`, `auto`, or `reset`, even after
-navigating or switching lemmas. A completed `auto` run is one undo entry.
-`redo` restores the exact resulting proof and selection without re-executing
+`undo` reverses the last successful `apply`, `auto`, `reset`, `add`, `edit`, or
+`delete`, even after navigating or switching lemmas. A completed `auto` run is
+one undo entry. `redo` restores declarations, proofs, and selection without re-executing
 methods. Navigation, selection, checking, and saving do not create history
 entries. A new successful mutation clears redo; failed commands do not.
 `reset` explicitly discards only the selected subtree, never an ancestor.
@@ -196,8 +237,8 @@ changing the proof, cursor, history, or revision. Refresh `state` or `methods`
 and reconsider the choice rather than automatically retrying an old index.
 
 Every response includes a monotonic integer `revision`. Successful load,
-lemma selection, branch navigation, goto, apply, reset, undo, redo, and check advance
-it, as does an auto run that applies methods; cancelled or zero-step auto runs
+lemma selection, branch navigation, goto, apply, reset, add, edit, delete, undo,
+redo, and check advance it, as does an auto run that applies methods; cancelled or zero-step auto runs
 do not. Errors (including timed-out/cancelled apply) and read-only observation,
 frontier, inspection, and save do not advance it. Undo/redo never
 restore old revision numbers, and reload does not reset the counter. Tokens
@@ -218,8 +259,8 @@ The backend can be used directly with
 `stack exec --no-install-ghc -- tamarin-prover proof-api`. It accepts one JSON
 object per input line and emits one response per ordinary request; engine diagnostics go
 to stderr. Requests use `command` and, where needed, `file`, `name`,
-`method_id`, `branch_id`, `node_id`, `detail`, `timeout_ms`, or `steps`.
-`apply`/`step` and `goto` require `expected_revision`; `timeout_ms`, when present,
+`method_id`, `branch_id`, `node_id`, `source`, `detail`, `timeout_ms`, or `steps`.
+`apply`/`step`, `goto`, `add`, `edit`, and `delete` require `expected_revision`; `timeout_ms`, when present,
 must be a positive integer (not `null`). `observe` and `state` accept `compact`
 (default), `goals`, or `full` detail. Command names match the REPL. While `auto`
 or `apply` is running, send `{"command":"cancel"}` to cancel it. This out-of-band
@@ -227,12 +268,19 @@ message never has its own reply (including when idle); the original operation
 reports cancellation. Auto retains its successful `auto_reason: "cancelled"`
 response; apply returns a `CANCELLED` error.
 
+`add` takes `source`; `edit` takes the existing `name` and replacement `source`;
+`delete` takes `name`. Mutation responses include `theory`, `lemmas`,
+`selected_lemma` (nullable), `operation`, `name`, and `invalidated_lemmas`; edits
+also include `previous_name`. When a lemma remains selected, compact state
+fields describe it. Undo/redo return the current listing and nullable selection,
+including when there is no selected lemma.
+
 Responses have `status: "success"` or `status: "error"` and the current
 `revision`; current-node status is `branch_status`. Error responses contain
 `error: {code, message, recoverable, suggested_action}`. Codes include
 `STALE_REVISION`, `INVALID_METHOD`, `INVALID_NODE`, `TIMEOUT`, `CANCELLED`,
 `RESOURCE_LIMIT`, `UNSUPPORTED_THEORY`, `INVALID_REQUEST`, `INVALID_STATE`,
-`IO_ERROR`, and `ENGINE_ERROR`. Python `BackendError` exposes `code`,
+`INVALID_LEMMA`, `LEMMA_EXISTS`, `IO_ERROR`, and `ENGINE_ERROR`. Python `BackendError` exposes `code`,
 `recoverable`, `suggested_action`, and the complete `response`.
 Trees, branches, and frontier entries expose numeric-path `node_id` values.
 On `apply`, `applied_at` identifies the node where the method ran and
@@ -292,10 +340,12 @@ executable and workspace path, for example:
 ```
 
 Tools are `tamarin_load`, `tamarin_lemma`, `tamarin_observe`, `tamarin_apply`,
-`tamarin_graph`, `tamarin_frontier`, `tamarin_goto`, `tamarin_save`, and `tamarin_check`.
+`tamarin_graph`, `tamarin_frontier`, `tamarin_goto`, `tamarin_save`, `tamarin_check`,
+`tamarin_add`, `tamarin_edit`, and `tamarin_delete`.
 `tamarin_lemma(name)` selects a lemma after loading; `observe` defaults to
 compact detail. Apply and goto require the revision of the selected method or
-node listing. Tool results expose the backend dictionary as structured content;
+node listing. Add/edit/delete require the inspected theory's revision and use
+the declaration-editing semantics above. Tool results expose the backend dictionary as structured content;
 errors retain their structured codes and set MCP `isError`. One backend persists
 across tool calls and is closed when the server exits.
 

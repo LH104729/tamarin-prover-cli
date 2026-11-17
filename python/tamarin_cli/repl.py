@@ -143,6 +143,23 @@ class TamarinShell(cmd.Cmd):
         if show_branches and response.get("branches"):
             self._show_branches(response)
 
+    def _show_mutation(self, response: Dict[str, Any]) -> None:
+        if "lemmas" in response:
+            self._show_lemmas(response)
+        if "selected_lemma" in response and response["selected_lemma"] is None:
+            self.current_node_id = None
+            self.displayed_revision = None
+            self.displayed_node_revision = None
+            self._print("No lemma selected.")
+        else:
+            self._show_state(response)
+
+    def _mutation_revision(self) -> int:
+        revision = self.client.revision
+        if revision is None:
+            raise ValueError("No session revision observed; load a theory first")
+        return revision
+
     def load_file(self, file: str) -> None:
         """Load one file, also used by the optional initial command-line file."""
         response = self.client.load(file)
@@ -169,6 +186,43 @@ class TamarinShell(cmd.Cmd):
         """lemma <name>: Select or resume a lemma; do not run any proof method."""
         name = self._arguments(argument, 1, "lemma <name>")[0]
         self._show_state(self.client.lemma(name))
+
+    def do_add(self, argument: str) -> None:
+        """add '<declaration>': Append and select a new native lemma.
+
+        Example: add 'lemma extra: exists-trace "Ex x #i. Pick(x) @ i"'
+        Quote the full declaration as one argument, including its formula quotes.
+        Native syntax, attributes, macros, and predicates are parsed by Tamarin.
+        Any supplied proof skeleton is ignored; the proof starts as sorry.
+        Changes stay in memory until save <file.spthy>; undo reverses the add.
+        """
+        source = self._arguments(argument, 1, "add '<full lemma declaration>'")[0]
+        self._show_mutation(self.client.add(source, revision=self._mutation_revision()))
+
+    def do_edit(self, argument: str) -> None:
+        """edit <name> '<declaration>': Replace a lemma in its current position.
+
+        Example: edit extra 'lemma renamed: exists-trace "Ex x #i. Pick(x) @ i"'
+        Quote the full native declaration as one argument. Its name may change;
+        its new proof starts as sorry, even if a proof skeleton was supplied.
+        The replacement is selected. Changes stay in memory until save.
+        """
+        name, source = self._arguments(
+            argument, 2, "edit <name> '<full lemma declaration>'"
+        )
+        self._show_mutation(
+            self.client.edit(name, source, revision=self._mutation_revision())
+        )
+
+    def do_delete(self, argument: str) -> None:
+        """delete <name>: Remove a lemma from the in-memory theory.
+
+        Example: delete renamed
+        Deleting the selected lemma clears the selection. Use undo to restore
+        the declaration and proof, or save <file.spthy> to persist the deletion.
+        """
+        name = self._arguments(argument, 1, "delete <name>")[0]
+        self._show_mutation(self.client.delete(name, revision=self._mutation_revision()))
 
     def do_state(self, argument: str) -> None:
         """state [full]: Show a compact summary, or the full native proof state.
@@ -369,20 +423,20 @@ class TamarinShell(cmd.Cmd):
         self._show_state(self.client.back())
 
     def do_undo(self, argument: str) -> None:
-        """undo: Undo the last apply/auto/reset, restoring its prior selection.
+        """undo: Undo the last proof or lemma mutation and its prior selection.
 
         History spans the session; navigation alone is not a mutation.
         """
         self._arguments(argument, 0, "undo")
-        self._show_state(self.client.undo())
+        self._show_mutation(self.client.undo())
 
     def do_redo(self, argument: str) -> None:
         """redo: Restore the last undone mutation and its resulting selection.
 
-        A new successful proof mutation clears redo history.
+        A new successful proof or lemma mutation clears redo history.
         """
         self._arguments(argument, 0, "redo")
-        self._show_state(self.client.redo())
+        self._show_mutation(self.client.redo())
 
     def do_reset(self, argument: str) -> None:
         """reset: Replace the selected proof subtree with an unfinished step.
@@ -457,6 +511,7 @@ class TamarinShell(cmd.Cmd):
     def do_save(self, argument: str) -> None:
         """save <file.spthy>: Save the native theory and recorded proofs.
 
+        Lemma additions, edits, deletions, and proofs remain in memory until save.
         Unfinished branches remain unfinished; saving does not prove them.
         """
         file = self._arguments(argument, 1, "save <file.spthy>")[0]

@@ -312,6 +312,28 @@ class TamarinClient:
         """Select or resume a named lemma, without applying a method."""
         return self.request("lemma", name=name)
 
+    def add(self, source: str, *, revision: int) -> Dict[str, Any]:
+        """Append one full native lemma declaration and select its fresh proof.
+
+        Pass the latest observed session revision. Changes remain in memory
+        until save; an optional proof skeleton is ignored and starts as sorry.
+        """
+        return self.request("add", source=source, expected_revision=revision)
+
+    def edit(self, name: str, source: str, *, revision: int) -> Dict[str, Any]:
+        """Replace a lemma in place, optionally renaming it, with a fresh proof.
+
+        Source is a full native declaration, not a filename. Pass the latest
+        observed session revision; save explicitly to persist the replacement.
+        """
+        return self.request(
+            "edit", name=name, source=source, expected_revision=revision
+        )
+
+    def delete(self, name: str, *, revision: int) -> Dict[str, Any]:
+        """Delete a lemma at the latest observed revision; save to persist it."""
+        return self.request("delete", name=name, expected_revision=revision)
+
     def observe(self, detail: str = "compact") -> Dict[str, Any]:
         """Inspect the selected node with compact, goals, or full detail."""
         return self.request("observe", detail=detail)
@@ -376,7 +398,7 @@ class TamarinClient:
         return self.request("back")
 
     def undo(self) -> Dict[str, Any]:
-        """Reverse the last proof mutation, restoring its theory and cursor."""
+        """Reverse the last proof or lemma mutation, restoring theory and cursor."""
         return self.request("undo")
 
     def redo(self) -> Dict[str, Any]:

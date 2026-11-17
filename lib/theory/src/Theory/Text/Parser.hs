@@ -21,6 +21,7 @@ module Theory.Text.Parser (
   , parseLemma
   -- , parsePlainLemma
   , parseLemmaWithMacros
+  , parseSingleLemmaWithMacros
   , parseRestriction
   , parseIntruderRules
   , liftedAddLemma
@@ -95,8 +96,16 @@ parseLemma = parseString [] "<unknown source>" (lemma Nothing)
 
 -- | Parse a lemma with a given signature, on the model of plainLemma, while also expanding macros.
 parseLemmaWithMacros :: OpenTheory -> String -> Either ParseError (Lemma ProofSkeleton)
-parseLemmaWithMacros thy input = do
-     case parseStringWState (mkMacroStateSig thy) "<unknown source>" (lemma Nothing) input of
+parseLemmaWithMacros = parseLemmaWithMacrosUsing (lemma Nothing)
+
+-- | Parse exactly one declaration for transactional theory editing.
+parseSingleLemmaWithMacros :: OpenTheory -> String -> Either ParseError (Lemma ProofSkeleton)
+parseSingleLemmaWithMacros = parseLemmaWithMacrosUsing (lemma Nothing <* eof)
+
+parseLemmaWithMacrosUsing :: Parser (SyntacticLemma ProofSkeleton)
+                         -> OpenTheory -> String -> Either ParseError (Lemma ProofSkeleton)
+parseLemmaWithMacrosUsing parser thy input = do
+     case parseStringWState (mkMacroStateSig thy) "<unknown source>" parser input of
        Left err -> Left err
        Right synLemma -> 
          case expandLemma thy synLemma of
